@@ -59,7 +59,7 @@
 | `P1-02` | P1 | `server.js` | 修复 `checkExternalPowerOn` 强行覆写用户手动关闭的保活开关 | `server.js` | [x] |
 | `P1-03` | P1 | `server.js` | 修复 `refreshOfficialTasks` 40010 未重试及用积分结果掩盖任务读取失败 | `server.js` | [x] |
 | `P1-04` | P1 | `server.js` | 修复 12h 续期风暴、`stopKeepAliveWorker` 定时器泄漏与打卡倒计时误清零 | `server.js` | [x] |
-| `P1-05` | P1 | `app/tasks` | 修复 `TaskScheduler` 多平台串扰、重复触发、`NaN` 死循环与无超时下单 | `app/tasks/scheduler.js`, `app/tasks/native_tasks.js` | [ ] |
+| `P1-05` | P1 | `app/tasks` | 修复 `TaskScheduler` 多平台串扰、重复触发、`NaN` 死循环与无超时下单 | `app/tasks/scheduler.js`, `app/tasks/native_tasks.js` | [x] |
 | `P1-06` | P1 | `server.js`, `auth_manager.js`, `ctyun_encryption.js` | 路由异常兜底、请求体限制、侧车进程清理、平台守卫、配额 `0` 修复 | `server.js`, `app/auth_manager.js`, `app/ctyun_encryption.js` | [ ] |
 | `P1-07` | P1 | `ydpc_client.js` | 修复 `verifyKeepAliveEffect` 必现 `ReferenceError: originCn is not defined` | `app/ydpc/ydpc_client.js` | [ ] |
 | `P1-08` | P1 | `ydpc_client.js` | 修复底座探测缓存失效、键类型不匹配、闭包陈旧 `vm`、数据面死循环与 MQTT 关闭失效 | `app/ydpc/ydpc_client.js` | [ ] |
@@ -336,6 +336,7 @@
   4. `scheduler.js:151-186`：在 `checkStartupCatchup()` 若某启用天翼云账号开启 `autoRedeem` 且今日 `lastRedeemDate !== todayStr`，置 `allDone = false`。
   5. `scheduler.js:689` 增加 `signal: AbortSignal.timeout(15000)`；`matchCronField` 校验 `stepNum > 0 && Number.isFinite(stepNum)` 并支持 `N/step` 写法。
   6. `native_tasks.js:505` 将 `if (acc.platform === 'ydpc')` 改为 `if (acc.platform === 'ydpc' || acc.platform === 'ecloud')`，直接复用该处返回，**确保文件内 `isCompleted: true` 硬编码字面量依然恰好为 3 处**（不触发回归组 3 失败！）。
+- **执行记录（2026-11-24）**：分项 Cron/四个兜底入口只派发天翼云任务，完成汇总只考核天翼云账号，纯移动账号不发天翼云汇总；主准点和巡检共享分钟占用，分项启用时准点复用巡检派发，保留同分钟独立 Cron 与未管辖分项各执行一次。共享兑换入口用于完整流程、兑换 Cron 和兜底，每次下单加实际 15 秒 signal，原子总积分、绑定属性、策略日、当天去重和最多三次重试/致命错误终止保持。严格过滤 HH:mm，全非法回退 01:20，并防御非 finite 延时；支持 N/step，拒绝非法 step；仅兑换待完成也触发启动补跑，native 挂机对 ecloud 复用移动平台早退且三处完成字面量保持。新增 9 项离线行为回归、20 项变异（M199–M218）；先复现 248 通过/9 失败（exit=1），修复后当前完整 `npm test` 为 257 通过/0 失败、18 个 JS 文件语法通过（exit=0），只读 review 与新增变异目标检查通过。未访问真实积分下单接口；完整阶段变异尚待 P1-06 后运行。
 
 ---
 

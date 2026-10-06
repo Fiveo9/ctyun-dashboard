@@ -1760,6 +1760,89 @@ const MUTATIONS = [
     id: 'M198', name: 'P1-04：停止 Worker 不再清理挂机重试和打卡复检', file: 'server.js',
     from: '    this.clearHangRetry();\n    this.clearSignVerify();', to: '',
   },
+  {
+    id: 'M199', name: 'P1-05：非法 HH:mm 再次进入目标时间列表', file: 'app/tasks/scheduler.js',
+    from: '.filter(t => /^(?:[01]\\d|2[0-3]):[0-5]\\d$/.test(t));', to: '.filter(Boolean);',
+  },
+  {
+    id: 'M200', name: 'P1-05：非 finite 延时闸门被移除', file: 'app/tasks/scheduler.js',
+    from: "    if (!Number.isFinite(delayMs)) {\n      this.appendLog('Scheduler', '调度时间无效，跳过本次计时器挂载。', 'warning');\n      return;\n    }", to: '',
+  },
+  {
+    id: 'M201', name: 'P1-05：Cron step 错误接受非数字后缀', file: 'app/tasks/scheduler.js',
+    from: 'const stepNum = Number(step);', to: 'const stepNum = parseInt(step, 10);',
+  },
+  {
+    id: 'M202', name: 'P1-05：N/step 写法再次无法匹配', file: 'app/tasks/scheduler.js',
+    from: 'const end = endText === undefined ? Infinity : Number(endText);', to: 'const end = Number(endText);',
+  },
+  {
+    id: 'M203', name: 'P1-05：分项巡检再次混入移动平台', file: 'app/tasks/scheduler.js',
+    from: "const accounts = (this.getAccounts() || []).filter(a => a.enabled && a.platform !== 'ydpc' && a.platform !== 'ecloud');",
+    to: 'const accounts = (this.getAccounts() || []).filter(a => a.enabled);',
+  },
+  {
+    id: 'M204', name: 'P1-05：移动平台空任务再次阻断天翼云汇总', file: 'app/tasks/scheduler.js',
+    from: "const ctyunAccounts = accounts.filter(a => a.platform !== 'ydpc' && a.platform !== 'ecloud');", to: 'const ctyunAccounts = accounts;',
+  },
+  {
+    id: 'M205', name: 'P1-05：纯移动账号错误发送天翼云完成汇总', file: 'app/tasks/scheduler.js',
+    from: '    if (ctyunAccounts.length === 0) return;', to: '',
+  },
+  {
+    id: 'M206', name: 'P1-05：兑换 Cron 与兜底再次只查询商品', file: 'app/tasks/scheduler.js',
+    from: 'this.runAutoRedeemForAccount(acc, client).catch(() => {});', to: 'client.getRewards().catch(() => {});', replaceAll: true,
+  },
+  {
+    id: 'M207', name: 'P1-05：完整流程不再调用共享下单', file: 'app/tasks/scheduler.js',
+    from: '            await this.runAutoRedeemForAccount(acc, client);', to: '            await client.getRewards();',
+  },
+  {
+    id: 'M208', name: 'P1-05：下单请求超时 signal 被移除', file: 'app/tasks/scheduler.js',
+    from: '                  signal: AbortSignal.timeout(15000)', to: '',
+  },
+  {
+    id: 'M209', name: 'P1-05：仅兑换待执行的启动补跑再次被误标完成', file: 'app/tasks/scheduler.js',
+    from: '      if (f.autoRedeem && !subCronMap.redeem && acc.redeemConfig?.lastRedeemDate !== todayStr) {\n        allDone = false;\n        break;\n      }', to: '',
+  },
+  {
+    id: 'M210', name: 'P1-05：准点回调忽略巡检已占用分钟', file: 'app/tasks/scheduler.js',
+    from: '      if (this.lastTriggerMinute === currentMinKey) {', to: '      if (false) {',
+  },
+  {
+    id: 'M211', name: 'P1-05：准点入口发起完整流程前不占用分钟', file: 'app/tasks/scheduler.js',
+    from: '      this.lastTriggerMinute = currentMinKey;\n      // 快照此刻的分项管辖表', to: '      // 快照此刻的分项管辖表',
+  },
+  {
+    id: 'M212', name: 'P1-05：四个兜底分项不再占用触发分钟', file: 'app/tasks/scheduler.js',
+    from: '      this.lastTriggerMinute = currentMinKey;\n      for (const acc of accounts) {', to: '      for (const acc of accounts) {', replaceAll: true,
+  },
+  {
+    id: 'M213', name: 'P1-05：准点先占用分钟导致同分钟独立 Cron 丢失', file: 'app/tasks/scheduler.js',
+    from: '      if (this.hasActiveSubCronRules()) {\n        // 同分钟独立 Cron 与未管辖分项由巡检统一派发，避免准点占用分钟后吞掉分项。\n        await this.heartbeatTick();\n        this.lastTriggerMinute = currentMinKey;\n        this.scheduleNextRun();\n        return;\n      }', to: '',
+  },
+  {
+    id: 'M214', name: 'P1-05：移动公众再次进入天翼云 native 挂机', file: 'app/tasks/native_tasks.js',
+    from: "async function executeNativeHang(client, acc, onLog = console.log) {\n  if (acc.platform === 'ydpc' || acc.platform === 'ecloud') {",
+    to: "async function executeNativeHang(client, acc, onLog = console.log) {\n  if (acc.platform === 'ydpc') {",
+  },
+  {
+    id: 'M215', name: 'P1-05：兑换成功不再保存当日去重日期', file: 'app/tasks/scheduler.js',
+    from: '              rConf.lastRedeemDate = todayStr;', to: '',
+  },
+  {
+    id: 'M216', name: 'P1-05：下单致命错误不再终止重试', file: 'app/tasks/scheduler.js',
+    from: '                if (isFatal) {', to: '                if (false) {',
+  },
+  {
+    id: 'M217', name: 'P1-05：共享兑换忽略策略日', file: 'app/tasks/scheduler.js',
+    from: '        if (shouldRedeem) {', to: '        if (true) {',
+  },
+  {
+    id: 'M218', name: 'P1-05：共享兑换不再排除移动平台', file: 'app/tasks/scheduler.js',
+    from: "    if (acc.enabled === false || acc.platform === 'ydpc' || acc.platform === 'ecloud' || !acc.features?.autoRedeem) return;",
+    to: '    if (acc.enabled === false || !acc.features?.autoRedeem) return;',
+  },
 ];
 
 // ---------------------------------------------------------------------------

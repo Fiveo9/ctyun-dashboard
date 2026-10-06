@@ -20,12 +20,18 @@ function matchCronField(field, val) {
   const parts = field.split(',');
   for (const part of parts) {
     if (part.includes('/')) {
-      const [range, step] = part.split('/');
-      const stepNum = parseInt(step, 10);
+      const stepped = part.split('/');
+      if (stepped.length !== 2) continue;
+      const [range, step] = stepped;
+      const stepNum = Number(step);
+      if (!Number.isFinite(stepNum) || !Number.isInteger(stepNum) || stepNum <= 0) continue;
       if (range === '*') {
         if (val % stepNum === 0) return true;
       } else {
-        const [start, end] = range.split('-').map(Number);
+        if (!/^\d+(?:-\d+)?$/.test(range)) continue;
+        const [startText, endText] = range.split('-');
+        const start = Number(startText);
+        const end = endText === undefined ? Infinity : Number(endText);
         if (val >= start && val <= end && (val - start) % stepNum === 0) return true;
       }
     } else if (part.includes('-')) {
@@ -115,7 +121,8 @@ class TaskScheduler {
     const settings = this.getSettings() || {};
     const cron = settings.cron || {};
     const rawTimes = cron.executeTime || cron.taskTime || '01:20';
-    const list = rawTimes.split(/[,，\s]+/).map(t => t.trim()).filter(Boolean);
+    const list = (typeof rawTimes === 'string' ? rawTimes : '').split(/[,，\s]+/).map(t => t.trim())
+      .filter(t => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(t));
     return list.length > 0 ? list : ['01:20'];
   }
 
@@ -174,6 +181,10 @@ class TaskScheduler {
         break;
       }
       if (this.taskGate(acc, 'cloudHang') && !subCronMap.cloudHang && !(hangTask && (hangTask.status === 2 || hangTask.current >= hangTask.total))) {
+        allDone = false;
+        break;
+      }
+      if (f.autoRedeem && !subCronMap.redeem && acc.redeemConfig?.lastRedeemDate !== todayStr) {
         allDone = false;
         break;
       }
@@ -244,6 +255,10 @@ class TaskScheduler {
     }
 
     const delayMs = Math.max(1000, nextTargetDate.getTime() - currentMs);
+    if (!Number.isFinite(delayMs)) {
+      this.appendLog('Scheduler', '调度时间无效，跳过本次计时器挂载。', 'warning');
+      return;
+    }
     const targetH = String(nextTargetDate.getHours()).padStart(2, '0');
     const targetM = String(nextTargetDate.getMinutes()).padStart(2, '0');
     const hoursAway = (delayMs / 3600000).toFixed(1);
@@ -251,6 +266,19 @@ class TaskScheduler {
     this.appendLog('Scheduler', `⏰ 下一次自动化任务将在北京时间 ${targetH}:${targetM} 准时执行 (约 ${hoursAway} 小时后)。`, 'info');
 
     this.nextRunTimer = setTimeout(async () => {
+      const currentMinKey = getBeijingDate().toISOString().substring(0, 16);
+      if (this.lastTriggerMinute === currentMinKey) {
+        this.scheduleNextRun();
+        return;
+      }
+      if (this.hasActiveSubCronRules()) {
+        // 同分钟独立 Cron 与未管辖分项由巡检统一派发，避免准点占用分钟后吞掉分项。
+        await this.heartbeatTick();
+        this.lastTriggerMinute = currentMinKey;
+        this.scheduleNextRun();
+        return;
+      }
+      this.lastTriggerMinute = currentMinKey;
       // 快照此刻的分项管辖表：分项 Cron 配置的任务类型由其自身 Cron 触发，主时间点只兜底未管辖分项
       const subCronMap = this.getSubCronMap();
       const excludedTasks = this.getExcludedTasksInfo(subCronMap);
@@ -333,7 +361,7 @@ class TaskScheduler {
 
     // 2. 如果启用了辅助规则且填写了具体 Cron 表达式：
     // 则严格以用户填写的各项辅助规则为准独立执行，未填写的分项则兜底遵循主调度中心时间
-    const accounts = (this.getAccounts() || []).filter(a => a.enabled);
+    const accounts = (this.getAccounts() || []).filter(a => a.enabled && a.platform !== 'ydpc' && a.platform !== 'ecloud');
 
     // 2.1 每日签到打卡分项规则
     if (cron.signCron?.trim()) {
@@ -356,6 +384,7 @@ class TaskScheduler {
       }
     } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
       // 辅助规则未配置该项，按主时间点兜底
+      this.lastTriggerMinute = currentMinKey;
       for (const acc of accounts) {
         if (this.taskGate(acc, 'sign')) {
           const client = this.getClient(acc);
@@ -385,6 +414,7 @@ class TaskScheduler {
       }
     } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
       // 辅助规则未配置该项，按主时间点兜底
+      this.lastTriggerMinute = currentMinKey;
       for (const acc of accounts) {
         if (this.taskGate(acc, 'aiChat')) {
           const client = this.getClient(acc);
@@ -399,7 +429,7 @@ class TaskScheduler {
         this.lastTriggerMinute = currentMinKey;
         this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [云电脑挂机] (Cron: ${cron.cloudHangCron})...`, 'info');
         for (const acc of accounts) {
-          if (this.taskGate(acc, 'cloudHang')) {
+          if (this.taskGate(acc, 'cloudHang') && acc.platform !== 'ydpc' && acc.platform !== 'ecloud') {
             const client = this.getClient(acc);
             executeNativeHang(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
           }
@@ -407,6 +437,7 @@ class TaskScheduler {
       }
     } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
       // 辅助规则未配置该项，按主时间点兜底
+      this.lastTriggerMinute = currentMinKey;
       for (const acc of accounts) {
         if (this.taskGate(acc, 'cloudHang') && acc.platform !== 'ydpc' && acc.platform !== 'ecloud') {
           const client = this.getClient(acc);
@@ -421,20 +452,169 @@ class TaskScheduler {
         this.lastTriggerMinute = currentMinKey;
         this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [自动兑换/抽奖] (Cron: ${cron.redeemCron})...`, 'info');
         for (const acc of accounts) {
-          if (acc.features?.autoRedeem) {
+          if (acc.features?.autoRedeem && acc.platform !== 'ydpc' && acc.platform !== 'ecloud') {
             const client = this.getClient(acc);
-            client.getRewards().catch(() => {});
+            this.runAutoRedeemForAccount(acc, client).catch(() => {});
           }
         }
       }
     } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
       // 辅助规则未配置该项，按主时间点兜底 (兑换仍受自身策略日限制约，由完整流程内判定)
+      this.lastTriggerMinute = currentMinKey;
       for (const acc of accounts) {
         if (acc.features?.autoRedeem && acc.platform !== 'ydpc' && acc.platform !== 'ecloud') {
           const client = this.getClient(acc);
-          client.getRewards().catch(() => {});
+          this.runAutoRedeemForAccount(acc, client).catch(() => {});
         }
       }
+    }
+  }
+
+  async runAutoRedeemForAccount(acc, client) {
+    if (acc.enabled === false || acc.platform === 'ydpc' || acc.platform === 'ecloud' || !acc.features?.autoRedeem) return;
+    try {
+      const rConf = acc.redeemConfig || {};
+      const todayStr = getBeijingDateStr();
+
+      if (rConf.lastRedeemDate !== todayStr && rConf.prodId) {
+        // 策略判定 (每月指定日含月末-1 / 每日 / 间隔天数)
+        const cstDay = parseInt(todayStr.split('-')[2], 10);
+        const ym = todayStr.split('-');
+        const lastDayOfMonth = new Date(Number(ym[0]), Number(ym[1]), 0).getDate();
+        let shouldRedeem = false;
+        let reason = '';
+
+        if (rConf.scheduleType === 'daily') {
+          shouldRedeem = true;
+          reason = '命中每日兑换策略';
+        } else if (rConf.scheduleType === 'interval_days') {
+          if (!rConf.lastRedeemDate) {
+            shouldRedeem = true;
+            reason = '首次执行间隔兑换';
+          } else {
+            const diffDays = Math.floor((new Date(todayStr).getTime() - new Date(rConf.lastRedeemDate).getTime()) / (1000 * 3600 * 24));
+            if (diffDays >= (parseInt(rConf.intervalDays) || 30)) {
+              shouldRedeem = true;
+              reason = `已间隔 ${diffDays} 天，达到设定的 ${rConf.intervalDays} 天`;
+            }
+          }
+        } else {
+          // monthly_days (默认)：monthlyDays 数组，-1 代表月末最后一天
+          const days = Array.isArray(rConf.monthlyDays) ? rConf.monthlyDays : [-1];
+          if (days.includes(cstDay) || (days.includes(-1) && cstDay === lastDayOfMonth)) {
+            shouldRedeem = true;
+            reason = (days.includes(-1) && cstDay === lastDayOfMonth) ? `命中月末最后一天 (${cstDay}号) 兑换策略` : `命中每月 ${cstDay} 号兑换策略`;
+          }
+        }
+
+        if (shouldRedeem) {
+          const prodType = rConf.prodType || 'pointstplupgrade';
+          const pId = Number(rConf.prodId);
+          // 判断商品是否需要绑定云电脑
+          const needsDesktop = [17023101, 17023111, 17024101, 17026101, 17026111].includes(pId) ||
+            ['pointstplupgrade', 'pointsdiskupgrade'].includes(String(prodType).toLowerCase().trim());
+
+          const targetDesktopId = parseInt(rConf.desktopId) || parseInt(client.metrics.desktopId) || parseInt(acc.stats?.desktopId) || 0;
+          if (needsDesktop && !targetDesktopId) {
+            this.appendLog('Redeem', `[${acc.name}] 自动兑换跳过: 该商品必须绑定云电脑，但名下未找到有效设备`, 'warning');
+          } else {
+            const buyTimes = Math.max(1, parseInt(rConf.maxRedeemTimes) || 1);
+            const totalCost = Number(rConf.costPoints) * buyTimes;
+            this.appendLog('Redeem', `[${acc.name}] ${reason}，准备自动下单兑换【${rConf.prodName || rConf.prodId}】x${buyTimes}，总计 ${totalCost} 积分...`, 'info');
+
+            let success = false;
+            let lastMsg = '';
+            let isRisk = false;
+
+            // 报文属性构建
+            const orderAttrs = [];
+            if (needsDesktop) {
+              orderAttrs.push({ attrKey: 'bindDesktopId', attrVal: Number(targetDesktopId) });
+            } else {
+              orderAttrs.push({ attrKey: 'mobilephone' });
+            }
+
+            // 原子总积分下单：单笔请求直传总积分 points = costPoints * times
+            // 天翼云 PaaS 将在云端一次性合并处理，直接生成 xN 扩容工单，彻底规避连续发单导致的扩容中锁定冲突！
+            const payload = {
+              busiChannel: '010',
+              orderType: 1,
+              pointType: Number(rConf.pointType) || 1,
+              points: totalCost,
+              sku: [{
+                execSort: 1,
+                prodId: Number(rConf.prodId),
+                prodType,
+                attrs: orderAttrs
+              }]
+            };
+
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                if (attempt > 1) {
+                  this.appendLog('Redeem', `[${acc.name}] 正在进行第 ${attempt}/3 次自动重试...`, 'info');
+                  await new Promise(r => setTimeout(r, 3000));
+                }
+                const res = await fetch('https://desk.ctyun.cn/selforder/api/selforder/paas/placeOrder', {
+                  method: 'POST',
+                  headers: client.getSignedHeaders({ 'Content-Type': 'application/json;charset=UTF-8' }),
+                  body: JSON.stringify(payload),
+                  signal: AbortSignal.timeout(15000)
+                });
+                const data = await res.json();
+                if (data.code === 0) {
+                  success = true;
+                  this.appendLog('Redeem', `[${acc.name}] ✅ 成功一次性完成【${rConf.prodName || rConf.prodId}】x${buyTimes} 自动兑换，共消耗 ${totalCost} 积分！`, 'success');
+                  break;
+                }
+                lastMsg = data.msg || `错误码 ${data.code}`;
+
+                const isFatal =
+                  lastMsg.includes('积分不足') ||
+                  lastMsg.includes('点数不足') ||
+                  lastMsg.includes('余额不足') ||
+                  lastMsg.includes('风控') ||
+                  lastMsg.includes('频繁') ||
+                  lastMsg.includes('异常操作') ||
+                  lastMsg.includes('超过最大') ||
+                  lastMsg.includes('上限');
+
+                if (isFatal) {
+                  if (lastMsg.includes('风控') || lastMsg.includes('频繁') || lastMsg.includes('异常操作')) {
+                    isRisk = true;
+                  }
+                  this.appendLog('Redeem', `[${acc.name}] 自动下单触发限制 (${lastMsg})，终止重试。`, 'warning');
+                  break;
+                }
+
+                this.appendLog('Redeem', `[${acc.name}] 第 ${attempt} 次自动兑换未成功: ${lastMsg}`, 'warning');
+              } catch (e) {
+                lastMsg = e.message;
+                this.appendLog('Redeem', `[${acc.name}] 第 ${attempt} 次网络异常: ${lastMsg}`, 'warning');
+              }
+            }
+
+            if (success) {
+              rConf.lastRedeemDate = todayStr;
+              acc.redeemConfig = rConf;
+              this.saveConfig();
+              this.sendNotification(
+                acc,
+                `🎉 天翼云自动兑换成功 - ${acc.name}`,
+                `策略: ${reason}\n账号【${acc.name}】成功兑换【${rConf.prodName || rConf.prodId}】x${buyTimes}，共消耗 ${totalCost} 积分。`
+              );
+            } else if (isRisk) {
+              this.appendLog('Redeem', `[${acc.name}] 自动兑换触发风控已自动中止: ${lastMsg}`, 'error');
+            } else {
+              this.appendLog('Redeem', `[${acc.name}] 自动兑换失败（已重试 3 次）: ${lastMsg}`, 'error');
+            }
+          }
+        }
+      } else if (rConf.lastRedeemDate === todayStr && rConf.prodId) {
+        this.appendLog('Redeem', `[${acc.name}] 今日自动兑换已完成，跳过重复执行。`, 'info');
+      }
+    } catch (e) {
+      this.appendLog('Redeem', `[${acc.name}] 自动兑换执行异常: ${e.message}`, 'error');
     }
   }
 
@@ -603,149 +783,7 @@ class TaskScheduler {
           if (excludeSet?.redeem) {
             this.appendLog('Scheduler', `[${acc.name}] 分项 [自动兑换] 由独立 Cron 管辖，本次主调度跳过。`, 'info');
           } else {
-          try {
-            const rConf = acc.redeemConfig || {};
-            const todayStr = getBeijingDateStr();
-
-            if (rConf.lastRedeemDate !== todayStr && rConf.prodId) {
-              // 策略判定 (每月指定日含月末-1 / 每日 / 间隔天数)
-              const cstDay = parseInt(todayStr.split('-')[2], 10);
-              const ym = todayStr.split('-');
-              const lastDayOfMonth = new Date(Number(ym[0]), Number(ym[1]), 0).getDate();
-              let shouldRedeem = false;
-              let reason = '';
-
-              if (rConf.scheduleType === 'daily') {
-                shouldRedeem = true;
-                reason = '命中每日兑换策略';
-              } else if (rConf.scheduleType === 'interval_days') {
-                if (!rConf.lastRedeemDate) {
-                  shouldRedeem = true;
-                  reason = '首次执行间隔兑换';
-                } else {
-                  const diffDays = Math.floor((new Date(todayStr).getTime() - new Date(rConf.lastRedeemDate).getTime()) / (1000 * 3600 * 24));
-                  if (diffDays >= (parseInt(rConf.intervalDays) || 30)) {
-                    shouldRedeem = true;
-                    reason = `已间隔 ${diffDays} 天，达到设定的 ${rConf.intervalDays} 天`;
-                  }
-                }
-              } else {
-                // monthly_days (默认)：monthlyDays 数组，-1 代表月末最后一天
-                const days = Array.isArray(rConf.monthlyDays) ? rConf.monthlyDays : [-1];
-                if (days.includes(cstDay) || (days.includes(-1) && cstDay === lastDayOfMonth)) {
-                  shouldRedeem = true;
-                  reason = (days.includes(-1) && cstDay === lastDayOfMonth) ? `命中月末最后一天 (${cstDay}号) 兑换策略` : `命中每月 ${cstDay} 号兑换策略`;
-                }
-              }
-
-              if (shouldRedeem) {
-                const prodType = rConf.prodType || 'pointstplupgrade';
-                const pId = Number(rConf.prodId);
-                // 判断商品是否需要绑定云电脑
-                const needsDesktop = [17023101, 17023111, 17024101, 17026101, 17026111].includes(pId) ||
-                  ['pointstplupgrade', 'pointsdiskupgrade'].includes(String(prodType).toLowerCase().trim());
-
-                const targetDesktopId = parseInt(rConf.desktopId) || parseInt(client.metrics.desktopId) || parseInt(acc.stats?.desktopId) || 0;
-                if (needsDesktop && !targetDesktopId) {
-                  this.appendLog('Redeem', `[${acc.name}] 自动兑换跳过: 该商品必须绑定云电脑，但名下未找到有效设备`, 'warning');
-                } else {
-                  const buyTimes = Math.max(1, parseInt(rConf.maxRedeemTimes) || 1);
-                  const totalCost = Number(rConf.costPoints) * buyTimes;
-                  this.appendLog('Redeem', `[${acc.name}] ${reason}，准备自动下单兑换【${rConf.prodName || rConf.prodId}】x${buyTimes}，总计 ${totalCost} 积分...`, 'info');
-
-                  let success = false;
-                  let lastMsg = '';
-                  let isRisk = false;
-
-                  // 报文属性构建
-                  const orderAttrs = [];
-                  if (needsDesktop) {
-                    orderAttrs.push({ attrKey: 'bindDesktopId', attrVal: Number(targetDesktopId) });
-                  } else {
-                    orderAttrs.push({ attrKey: 'mobilephone' });
-                  }
-
-                  // 原子总积分下单：单笔请求直传总积分 points = costPoints * times
-                  // 天翼云 PaaS 将在云端一次性合并处理，直接生成 xN 扩容工单，彻底规避连续发单导致的扩容中锁定冲突！
-                  const payload = {
-                    busiChannel: '010',
-                    orderType: 1,
-                    pointType: Number(rConf.pointType) || 1,
-                    points: totalCost,
-                    sku: [{
-                      execSort: 1,
-                      prodId: Number(rConf.prodId),
-                      prodType,
-                      attrs: orderAttrs
-                    }]
-                  };
-
-                  for (let attempt = 1; attempt <= 3; attempt++) {
-                    try {
-                      if (attempt > 1) {
-                        this.appendLog('Redeem', `[${acc.name}] 正在进行第 ${attempt}/3 次自动重试...`, 'info');
-                        await new Promise(r => setTimeout(r, 3000));
-                      }
-                      const res = await fetch('https://desk.ctyun.cn/selforder/api/selforder/paas/placeOrder', {
-                        method: 'POST',
-                        headers: client.getSignedHeaders({ 'Content-Type': 'application/json;charset=UTF-8' }),
-                        body: JSON.stringify(payload)
-                      });
-                      const data = await res.json();
-                      if (data.code === 0) {
-                        success = true;
-                        this.appendLog('Redeem', `[${acc.name}] ✅ 成功一次性完成【${rConf.prodName || rConf.prodId}】x${buyTimes} 自动兑换，共消耗 ${totalCost} 积分！`, 'success');
-                        break;
-                      }
-                      lastMsg = data.msg || `错误码 ${data.code}`;
-
-                      const isFatal = 
-                        lastMsg.includes('积分不足') || 
-                        lastMsg.includes('点数不足') || 
-                        lastMsg.includes('余额不足') ||
-                        lastMsg.includes('风控') || 
-                        lastMsg.includes('频繁') || 
-                        lastMsg.includes('异常操作') ||
-                        lastMsg.includes('超过最大') ||
-                        lastMsg.includes('上限');
-
-                      if (isFatal) {
-                        if (lastMsg.includes('风控') || lastMsg.includes('频繁') || lastMsg.includes('异常操作')) {
-                          isRisk = true;
-                        }
-                        this.appendLog('Redeem', `[${acc.name}] 自动下单触发限制 (${lastMsg})，终止重试。`, 'warning');
-                        break;
-                      }
-
-                      this.appendLog('Redeem', `[${acc.name}] 第 ${attempt} 次自动兑换未成功: ${lastMsg}`, 'warning');
-                    } catch (e) {
-                      lastMsg = e.message;
-                      this.appendLog('Redeem', `[${acc.name}] 第 ${attempt} 次网络异常: ${lastMsg}`, 'warning');
-                    }
-                  }
-
-                  if (success) {
-                    rConf.lastRedeemDate = todayStr;
-                    acc.redeemConfig = rConf;
-                    this.saveConfig();
-                    this.sendNotification(
-                      acc,
-                      `🎉 天翼云自动兑换成功 - ${acc.name}`,
-                      `策略: ${reason}\n账号【${acc.name}】成功兑换【${rConf.prodName || rConf.prodId}】x${buyTimes}，共消耗 ${totalCost} 积分。`
-                    );
-                  } else if (isRisk) {
-                    this.appendLog('Redeem', `[${acc.name}] 自动兑换触发风控已自动中止: ${lastMsg}`, 'error');
-                  } else {
-                    this.appendLog('Redeem', `[${acc.name}] 自动兑换失败（已重试 3 次）: ${lastMsg}`, 'error');
-                  }
-                }
-              }
-            } else if (rConf.lastRedeemDate === todayStr && rConf.prodId) {
-              this.appendLog('Redeem', `[${acc.name}] 今日自动兑换已完成，跳过重复执行。`, 'info');
-            }
-          } catch (e) {
-            this.appendLog('Redeem', `[${acc.name}] 自动兑换执行异常: ${e.message}`, 'error');
-          }
+            await this.runAutoRedeemForAccount(acc, client);
           }
         }
 
@@ -765,8 +803,10 @@ class TaskScheduler {
     }
 
     // 严格判定：只有当所有账号已开启的全部任务（包括挂机满 1 小时）都真正达成时，才标记今日流程圆满完成
+    const ctyunAccounts = accounts.filter(a => a.platform !== 'ydpc' && a.platform !== 'ecloud');
+    if (ctyunAccounts.length === 0) return;
     let allAccountsFullyDone = true;
-    for (const acc of accounts) {
+    for (const acc of ctyunAccounts) {
       const client = this.getClient(acc);
       const tasks = client?.metrics?.officialTasks || [];
       const loginTask = tasks.find(t => t.name.includes('登录AI云电脑'));

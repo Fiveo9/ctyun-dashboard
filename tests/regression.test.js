@@ -6749,6 +6749,230 @@ testAsync('P1-04：112 桌面 ID 接受 uint32 边界，非法范围/小数不�
   }
 });
 
+function phase2SchedulerAccount(id, platform = 'ctyun', features = {}) {
+  return { id, name: `fixture-${id}`, platform, enabled: true, stats: {},
+    features: { keepAlive: false, autoSign: true, aiChat: true, cloudHang: true, autoRedeem: false, ...features },
+    redeemConfig: { prodId: 55, prodType: 'fixture-product', costPoints: 25, maxRedeemTimes: 2, scheduleType: 'daily' },
+  };
+}
+
+function phase2SchedulerHarness({ accounts = [phase2SchedulerAccount('ct')], cron = {}, responses = [{ code: 0 }], immediateSleeps = false } = {}) {
+  const vm = require('vm');
+  const clock = phase2FakeClock(new Date(2026, 10, 24, 12, 0, 0).getTime());
+  const nativeCalls = [], orders = [], notifications = [], warnings = [], sleepDurations = [], fullRuns = [];
+  let saves = 0, rewardReads = 0;
+  const clients = new Map(accounts.map(acc => [acc.id, {
+    metrics: { desktopId: 101, officialTasks: acc.platform === 'ctyun' ? [
+      { name: '登录AI云电脑', status: 2, current: 1, total: 1 },
+      { name: 'AI对话', status: 2, current: 1, total: 1 },
+      { name: '使用1小时', status: 2, current: 3600, total: 3600 },
+    ] : [] },
+    refreshOfficialTasks: async () => ({ ok: true }), getRewards: async () => { rewardReads++; return []; },
+    getSignedHeaders: () => ({ fixture: true }), workerRunning: false,
+    startKeepAliveWorker() { this.workerRunning = true; }, stopKeepAliveWorker() { this.workerRunning = false; },
+  }]));
+  const invoke = task => async (_, acc) => { nativeCalls.push([task, acc.id]); return { isCompleted: true }; };
+  const context = { module: { exports: {} }, console, ...clock.globals,
+    require: id => { assert.strictEqual(id, './native_tasks'); return {
+      executeNativeSign: invoke('sign'), executeNativeAiChat: invoke('aiChat'), executeNativeHang: invoke('cloudHang'),
+    }; },
+    setTimeout: (fn, ms) => {
+      if (immediateSleeps && Number.isFinite(ms) && ms >= 2000 && ms <= 15000) { sleepDurations.push(ms); fn(); return 0; }
+      return clock.globals.setTimeout(fn, ms);
+    },
+    AbortSignal: { timeout: ms => ({ fixtureTimeoutMs: ms }) },
+    fetch: async (url, options) => {
+      orders.push({ url, options, payload: JSON.parse(options.body) });
+      const data = responses[Math.min(orders.length - 1, responses.length - 1)];
+      if (data instanceof Error) throw data;
+      return { json: async () => data };
+    },
+  };
+  vm.runInNewContext(scheduler, context);
+  context.getBeijingDate = () => new Date(clock.now);
+  context.getBeijingDateStr = () => '2026-11-24';
+  context.getBeijingTimeString = () => '2026-11-24 12:00:00';
+  const Scheduler = context.module.exports.TaskScheduler || context.module.exports;
+  const instance = new Scheduler({
+    getAccounts: () => accounts, getSettings: () => ({ cron: { executeTime: '12:00', ...cron } }),
+    getClient: acc => clients.get(acc.id), appendLog: (...args) => warnings.push(args),
+    sendNotification: (...args) => notifications.push(args), saveConfig: () => { saves++; },
+  });
+  const runAll = instance.runAllAccounts.bind(instance);
+  instance.runAllAccounts = async (...args) => { fullRuns.push(args); return runAll(...args); };
+  return { instance, context, clock, accounts, clients, nativeCalls, orders, notifications, warnings, sleepDurations, fullRuns,
+    get saves() { return saves; }, get rewardReads() { return rewardReads; } };
+}
+
+test('P1-05：Cron step 拒绝零/非数字/残缺值，支持 N/step 与范围步进', () => {
+  const h = phase2SchedulerHarness();
+  for (const field of ['*/0', '*/x', '*/2junk', '*/-2', '*/Infinity', '*/1.5', '*/2/3']) {
+    assert.strictEqual(h.context.matchCronField(field, 4), false, '非法 Cron step 不能触发');
+  }
+  for (const [field, value, expected] of [['3/5', 3, true], ['3/5', 8, true], ['3/5', 2, false],
+    ['3/5', 9, false], ['2-10/4', 6, true], ['2-10/4', 11, false], ['*/5', 10, true], ['1,3-5', 4, true]]) {
+    assert.strictEqual(h.context.matchCronField(field, value), expected);
+  }
+});
+
+test('P1-05：只接受合法 HH:mm，非法全量回退，延时非 finite 时不得挂载', () => {
+  for (const [executeTime, expected] of [
+    ['bad 24:00 23:60 9:00 09:00,23:59，00:00', ['09:00', '23:59', '00:00']],
+    ['bad 99:99 NaN', ['01:20']], [42, ['01:20']],
+  ]) {
+    const h = phase2SchedulerHarness({ cron: { executeTime } });
+    assert.deepStrictEqual(Array.from(h.instance.getTargetTimes()), expected);
+    h.instance.scheduleNextRun();
+    assert.strictEqual(h.clock.timers.size, 1);
+    assert.ok([...h.clock.timers.values()].every(t => Number.isFinite(t.ms) && t.ms >= 1000), '调度不允许 NaN/无限延时');
+    h.instance.stop();
+  }
+  const invalid = phase2SchedulerHarness();
+  invalid.instance.getTargetTimes = () => ['not-time'];
+  invalid.instance.scheduleNextRun();
+  assert.strictEqual(invalid.clock.timers.size, 0, '最后一道 finite 闸门必须拒绝无效延时');
+  assert.ok(invalid.warnings.some(x => x[2] === 'warning'));
+});
+
+testAsync('P1-05：混合平台只用天翼云判定完成，纯移动账号不发送天翼云汇总', async () => {
+  const mixed = phase2SchedulerHarness({ accounts: [phase2SchedulerAccount('ct'), phase2SchedulerAccount('yd', 'ydpc'), phase2SchedulerAccount('ec', 'ecloud')], immediateSleeps: true });
+  await mixed.instance.runAllAccounts();
+  assert.strictEqual(mixed.instance.lastCompletedDate, '2026-11-24', '移动平台的空官方任务不能阻断天翼云今日完成');
+  assert.strictEqual(mixed.notifications.length, 1);
+  assert.ok(mixed.nativeCalls.every(([, id]) => id === 'ct'));
+  assert.strictEqual(mixed.instance.isRunning, false);
+  const mobile = phase2SchedulerHarness({ accounts: [phase2SchedulerAccount('yd', 'ydpc'), phase2SchedulerAccount('ec', 'ecloud')], immediateSleeps: true });
+  await mobile.instance.runAllAccounts();
+  assert.strictEqual(mobile.notifications.length, 0, '纯移动账号不应该发送天翼云汇总');
+  assert.strictEqual(mobile.instance.isRunning, false);
+});
+
+testAsync('P1-05：分项 Cron 和所有主时间兜底仅执行天翼云任务', async () => {
+  for (const cron of [
+    { enableSubCron: true, signCron: '* * * * *', aiChatCron: '* * * * *', cloudHangCron: '* * * * *', redeemCron: '* * * * *' },
+    { enableSubCron: true, redeemCron: '0 1 * * *' },
+  ]) {
+    const h = phase2SchedulerHarness({ cron, accounts: ['ctyun', 'ydpc', 'ecloud'].map((platform, i) => phase2SchedulerAccount(String(i), platform)) });
+    await h.instance.heartbeatTick();
+    await phase2Flush();
+    assert.deepStrictEqual(h.nativeCalls, [['sign', '0'], ['aiChat', '0'], ['cloudHang', '0']], '任何分项/兜底都不能调用移动平台的天翼云原生任务');
+    h.instance.stop();
+  }
+});
+
+testAsync('P1-05：完整流程、兑换 Cron 与兜底共用实际下单，15 秒 signal 和原子总积分保持', async () => {
+  for (const mode of ['full', 'cron', 'fallback']) {
+    const acc = phase2SchedulerAccount('redeem', 'ctyun', { autoSign: false, aiChat: false, cloudHang: false, autoRedeem: true });
+    const cron = mode === 'cron' ? { enableSubCron: true, redeemCron: '* * * * *' } : mode === 'fallback' ? { enableSubCron: true, signCron: '0 1 * * *' } : {};
+    const h = phase2SchedulerHarness({ accounts: [acc], cron, immediateSleeps: true });
+    if (mode === 'full') await h.instance.runAllAccounts(); else { await h.instance.heartbeatTick(); await phase2Flush(); }
+    assert.strictEqual(h.orders.length, 1, '兑换分项不能仅查询商品列表');
+    assert.strictEqual(h.rewardReads, 0);
+    const order = h.orders[0];
+    assert.strictEqual(order.url, 'https://desk.ctyun.cn/selforder/api/selforder/paas/placeOrder');
+    assert.strictEqual(order.options.signal?.fixtureTimeoutMs, 15000, '下单请求必须带实际 15 秒超时 signal');
+    assert.strictEqual(order.payload.points, 50);
+    assert.strictEqual(order.payload.sku.length, 1, '多次兑换仍合并为原子总积分单笔');
+    assert.strictEqual(acc.redeemConfig.lastRedeemDate, '2026-11-24');
+    assert.ok(h.saves > 0);
+    h.instance.stop();
+  }
+});
+
+testAsync('P1-05：共享兑换保持设备绑定、策略/当天去重、最多三次重试及致命错误终止', async () => {
+  for (const sample of [
+    { responses: [{ code: 1, msg: 'temporary' }, { code: 0 }], expected: 2, done: true },
+    { responses: [{ code: 1, msg: '积分不足' }], expected: 1 },
+    { responses: [{ code: 1, msg: '风控限制' }], expected: 1 },
+    { responses: [new Error('fixture timeout')], expected: 3 },
+  ]) {
+    const acc = phase2SchedulerAccount('redeem', 'ctyun', { autoRedeem: true });
+    Object.assign(acc.redeemConfig, { prodId: 17023101, prodType: 'pointstplupgrade', desktopId: 101 });
+    const h = phase2SchedulerHarness({ accounts: [acc], responses: sample.responses, immediateSleeps: true });
+    assert.strictEqual(typeof h.instance.runAutoRedeemForAccount, 'function', '共享兑换入口必须存在');
+    await h.instance.runAutoRedeemForAccount(acc, h.clients.get(acc.id));
+    assert.strictEqual(h.orders.length, sample.expected);
+    assert.ok(h.orders.every(o => o.options.signal.fixtureTimeoutMs === 15000));
+    assert.deepStrictEqual(h.orders[0].payload.sku[0].attrs, [{ attrKey: 'bindDesktopId', attrVal: 101 }]);
+    assert.strictEqual(acc.redeemConfig.lastRedeemDate === '2026-11-24', !!sample.done);
+    if (sample.done) { await h.instance.runAutoRedeemForAccount(acc, h.clients.get(acc.id)); assert.strictEqual(h.orders.length, sample.expected); }
+    assert.ok(h.sleepDurations.every(ms => ms === 3000));
+  }
+  for (const redeemConfig of [
+    { scheduleType: 'monthly_days', monthlyDays: [23] },
+    { scheduleType: 'interval_days', lastRedeemDate: '2026-11-23', intervalDays: 2 },
+  ]) {
+    const acc = phase2SchedulerAccount('not-due', 'ctyun', { autoRedeem: true });
+    Object.assign(acc.redeemConfig, redeemConfig);
+    const h = phase2SchedulerHarness({ accounts: [acc] });
+    await h.instance.runAutoRedeemForAccount(acc, h.clients.get(acc.id));
+    assert.strictEqual(h.orders.length, 0, '非策略日不能下单');
+  }
+  for (const sample of [{ platform: 'ctyun', enabled: false }, { platform: 'ydpc', enabled: true }, { platform: 'ecloud', enabled: true }]) {
+    const acc = phase2SchedulerAccount('excluded', sample.platform, { autoRedeem: true });
+    acc.enabled = sample.enabled;
+    const h = phase2SchedulerHarness({ accounts: [acc] });
+    await h.instance.runAutoRedeemForAccount(acc, h.clients.get(acc.id));
+    assert.strictEqual(h.orders.length, 0, '共享兑换入口也必须排除停用和移动平台账号');
+  }
+});
+
+testAsync('P1-05：仅自动兑换未完成也需启动补跑，已完成或独立 Cron 管辖则不抢跑', async () => {
+  for (const sample of [{ pending: true }, { completed: true }, { governed: true }]) {
+    const acc = phase2SchedulerAccount('catchup', 'ctyun', { autoSign: false, aiChat: false, cloudHang: false, autoRedeem: true });
+    if (sample.completed) acc.redeemConfig.lastRedeemDate = '2026-11-24';
+    const h = phase2SchedulerHarness({ accounts: [acc], cron: { executeTime: '01:20', enableSubCron: !!sample.governed, redeemCron: sample.governed ? '* * * * *' : '' } });
+    const caught = [];
+    h.instance.runAllAccounts = async (...args) => caught.push(args);
+    await h.instance.checkStartupCatchup();
+    assert.strictEqual(caught.length, sample.pending ? 1 : 0, '待兑换账号不能被误标完成，也不能抢跑独立 Cron');
+    if (sample.pending) assert.notStrictEqual(h.instance.lastCompletedDate, '2026-11-24');
+  }
+});
+
+testAsync('P1-05：准点与巡检任意先后同分钟只触发一次，独立 Cron 和未管辖分项均不丢失', async () => {
+  for (const active of [false, true]) for (const pointFirst of [false, true]) {
+    const acc = phase2SchedulerAccount('minute', 'ctyun', { autoRedeem: true });
+    const h = phase2SchedulerHarness({ accounts: [acc], cron: { executeTime: '12:01', enableSubCron: active, signCron: active ? '1 12 * * *' : '' }, immediateSleeps: true });
+    h.clients.get(acc.id).metrics.officialTasks = [];
+    h.instance.scheduleNextRun();
+    const pointId = h.clock.find(60000), pointCallback = h.clock.timers.get(pointId).fn;
+    h.clock.advance(60000);
+    if (pointFirst) { await h.clock.fire(pointId); await h.instance.heartbeatTick(); }
+    else { await h.instance.heartbeatTick(); await pointCallback(); }
+    await phase2Flush();
+    await h.instance.heartbeatTick();
+    await phase2Flush();
+    assert.deepStrictEqual(h.nativeCalls, [['sign', 'minute'], ['aiChat', 'minute'], ['cloudHang', 'minute']], '共享分钟占用不得重复或吞掉同分钟不同分项');
+    assert.strictEqual(h.orders.length, 1);
+    if (!active) assert.strictEqual(h.fullRuns.length, 1);
+    h.instance.stop();
+  }
+  for (const [key, feature] of [['signCron', 'autoSign'], ['aiChatCron', 'aiChat'], ['cloudHangCron', 'cloudHang'], ['redeemCron', 'autoRedeem']]) {
+    const cron = { enableSubCron: true, signCron: '0 1 * * *', aiChatCron: '0 1 * * *', cloudHangCron: '0 1 * * *', redeemCron: '0 1 * * *', [key]: '' };
+    const acc = phase2SchedulerAccount('single-fallback', 'ctyun', { autoSign: false, aiChat: false, cloudHang: false, autoRedeem: false, [feature]: true });
+    const h = phase2SchedulerHarness({ accounts: [acc], cron, responses: [{ code: 1, msg: '积分不足' }] });
+    await h.instance.heartbeatTick();
+    await phase2Flush();
+    assert.strictEqual(h.instance.lastTriggerMinute, new Date(h.clock.now).toISOString().substring(0, 16), '每个兜底分项都必须独立占用分钟');
+    await h.instance.heartbeatTick();
+    await phase2Flush();
+    assert.strictEqual(h.nativeCalls.length + h.orders.length, 1, '只有一个兜底分项时也不能同分钟重跑');
+    h.instance.stop();
+  }
+});
+
+testAsync('P1-05：native 挂机对两个移动平台早退，天翼云仍调用真实执行入口', async () => {
+  const execute = new Function(`${extractMethodFrom(native, 'async function executeNativeHang(client, acc, onLog = console.log)')}\nreturn executeNativeHang;`)();
+  for (const platform of ['ydpc', 'ecloud', 'ctyun']) {
+    let calls = 0;
+    const result = await execute({ runHangTask: async () => { calls++; return { isCompleted: false }; } }, { platform, name: 'fixture-hang' }, () => {});
+    assert.strictEqual(calls, platform === 'ctyun' ? 1 : 0, '移动公众不能进入天翼云挂机入口');
+    assert.strictEqual(result.isCompleted, platform !== 'ctyun');
+  }
+  assert.strictEqual((native.match(/isCompleted:\s*true/g) || []).length, 3, 'native 的三处完成返回字面量必须保持');
+});
+
 // ============================================================================
 // 汇总输出（先跑完全部异步断言，再统一出结果）
 // ============================================================================

@@ -2333,7 +2333,9 @@ class CtYunClient {
   checkExternalPowerOn(desktop) {
     if (!desktop) return;
     const isRunning = desktop.useStatusText === '运行中' || desktop.useStatus == 25;
-    if (isRunning && !this.resolveTask('keepAlive').enabled) {
+    // 仅恢复电源关机联动造成的暂停，不覆写用户关闭保活或停用账号的意图。
+    if (isRunning && this.account.enabled !== false && this.account.manualShutdown === true) {
+      this.account.features = this.account.features || {};
       this.account.features.keepAlive = true;
       this.account.manualShutdown = false;
       this.account.stats = this.account.stats || {};

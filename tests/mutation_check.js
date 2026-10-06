@@ -1625,6 +1625,27 @@ const MUTATIONS = [
     from: 'feishuSecret = feishuSecret || split.secret;',
     to: 'feishuSecret = split.secret;',
   },
+  {
+    id: 'M174',
+    name: 'P1-02：外部在线状态再次覆写用户手动关闭保活',
+    file: 'server.js',
+    from: 'if (isRunning && this.account.enabled !== false && this.account.manualShutdown === true) {',
+    to: 'if (isRunning && this.account.enabled !== false) {',
+  },
+  {
+    id: 'M175',
+    name: 'P1-02：外部开机恢复不再尊重账号停用',
+    file: 'server.js',
+    from: 'if (isRunning && this.account.enabled !== false && this.account.manualShutdown === true) {',
+    to: 'if (isRunning && this.account.manualShutdown === true) {',
+  },
+  {
+    id: 'M176',
+    name: 'P1-02：恢复保活前不再初始化缺失的 features',
+    file: 'server.js',
+    from: 'if (isRunning && this.account.enabled !== false && this.account.manualShutdown === true) {\n      this.account.features = this.account.features || {};',
+    to: 'if (isRunning && this.account.enabled !== false && this.account.manualShutdown === true) {',
+  },
 ];
 
 // ---------------------------------------------------------------------------

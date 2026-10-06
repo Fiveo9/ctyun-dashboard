@@ -6285,6 +6285,30 @@ testAsync('P0-07：侧车登录/短信/重登清密码，IPC 无裸 Token，POSI
 
 group('Phase 2 · 主服务与调度器修复');
 
+function phase2CtYunMethods(anchors, globals = {}) {
+  const vm = require('vm');
+  const source = anchors.map(anchor => extractMethodFrom(server, anchor)).join(',\n');
+  return vm.runInNewContext(`({\n${source}\n})`, {
+    Buffer, URL, console, Date,
+    appConfig: {}, appendLog() {},
+    saveConfig() { throw new Error('测试必须提供隔离配置保存'); },
+    setTimeout() { throw new Error('测试必须提供隔离定时器'); }, clearTimeout() {},
+    setInterval() { throw new Error('测试必须提供隔离定时器'); }, clearInterval() {},
+    ...globals,
+  });
+}
+
+function phase2PowerRestoreHarness(account) {
+  let started = 0;
+  let saved = 0;
+  const api = phase2CtYunMethods(['checkExternalPowerOn(desktop)'], { saveConfig: () => { saved++; } });
+  const resolve = new Function('TASK_CN_NAME', 'TASK_FEATURE_KEY', 'ECLOUD_KEEPALIVE_TASKS',
+    `${phase1ServerFunction('resolveTaskEnabled')}\nreturn resolveTaskEnabled;`)({}, {}, new Set());
+  const client = { account, resolveTask: type => resolve(account, null, type), startKeepAliveWorker: () => { started++; } };
+  return { check: desktop => api.checkExternalPowerOn.call(client, desktop),
+    get started() { return started; }, get saved() { return saved; } };
+}
+
 testAsync('P1-01：管理员通知测试透传签名，未提供时继承配置，显式空值可清空且鉴权不变', async () => {
   const storedSignature = 'fixture-stored-signature';
   for (const sample of [
@@ -6341,6 +6365,44 @@ testAsync('P1-01：飞书实际签名使用独立字段优先，URL 后缀不发
     assert.match(payload.timestamp, /^\d+$/);
     const expected = crypto.createHmac('sha256', `${payload.timestamp}\n${sample.expected}`).update('').digest('base64');
     assert.ok(payload.sign === expected, '飞书签名字段优先级或算法不正确');
+  }
+});
+
+test('P1-02：用户手动关闭保活与已停用账号不被桌面在线状态复活', () => {
+  for (const sample of [
+    { enabled: true, manualShutdown: false },
+    { enabled: true },
+    { enabled: false, manualShutdown: true },
+  ]) {
+    const account = { ...sample, name: 'fixture-power', features: { keepAlive: false, autoSign: false }, stats: { keepAliveStatus: 'offline' } };
+    const features = account.features;
+    const h = phase2PowerRestoreHarness(account);
+    h.check({ useStatus: 25, useStatusText: '运行中' });
+    assert.strictEqual(account.features.keepAlive, false, '在线状态不得覆写用户关闭保活或账号停用');
+    assert.strictEqual(account.features, features);
+    assert.strictEqual(account.features.autoSign, false);
+    assert.strictEqual(account.manualShutdown, sample.manualShutdown);
+    assert.strictEqual(account.stats.keepAliveStatus, 'offline');
+    assert.strictEqual(h.started, 0);
+    assert.strictEqual(h.saved, 0);
+  }
+});
+
+test('P1-02：仅电源联动暂停可恢复，空 features 安全初始化，恢复只启动一次', () => {
+  for (const features of [undefined, null, { keepAlive: false, autoSign: false }]) {
+    const account = { enabled: true, manualShutdown: true, name: 'fixture-power', features };
+    const h = phase2PowerRestoreHarness(account);
+    h.check(null);
+    h.check({ useStatus: 0, useStatusText: '已关机' });
+    assert.strictEqual(h.started, 0, '未知/关机状态不得恢复');
+    h.check({ useStatus: '25' });
+    assert.ok(account.features && account.features.keepAlive === true, '电源恢复必须初始化并恢复保活');
+    assert.strictEqual(account.manualShutdown, false);
+    assert.strictEqual(account.stats.keepAliveStatus, 'online');
+    if (features) assert.strictEqual(account.features.autoSign, false, '其他功能字段保持不变');
+    h.check({ useStatusText: '运行中' });
+    assert.strictEqual(h.started, 1);
+    assert.strictEqual(h.saved, 1);
   }
 });
 

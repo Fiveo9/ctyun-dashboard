@@ -56,7 +56,7 @@
 | `P0-06` | P0 | `app/static` | 移除第三方二维码外链，本地生成扫码登录二维码 | `app/static/app.js`, `server.js` | [x] |
 | `P0-07` | P0 | `auth_manager.js`, `sidecar.py`, 全局 | `scrypt` 密码哈希升级、改密吊销会话、`0600` 落盘与安全随机数 | `app/auth_manager.js`, `app/ecloud_engine/sidecar.py`, `native_tasks.js`, `soho_client.js`, `server.js` | [x] |
 | `P1-01` | P1 | `server.js` | 修复飞书通知未用剥离后 URL 与管理员测推送漏传 `secret` | `server.js` | [x] |
-| `P1-02` | P1 | `server.js` | 修复 `checkExternalPowerOn` 强行覆写用户手动关闭的保活开关 | `server.js` | [ ] |
+| `P1-02` | P1 | `server.js` | 修复 `checkExternalPowerOn` 强行覆写用户手动关闭的保活开关 | `server.js` | [x] |
 | `P1-03` | P1 | `server.js` | 修复 `refreshOfficialTasks` 40010 未重试及用积分结果掩盖任务读取失败 | `server.js` | [ ] |
 | `P1-04` | P1 | `server.js` | 修复 12h 续期风暴、`stopKeepAliveWorker` 定时器泄漏与打卡倒计时误清零 | `server.js` | [ ] |
 | `P1-05` | P1 | `app/tasks` | 修复 `TaskScheduler` 多平台串扰、重复触发、`NaN` 死循环与无超时下单 | `app/tasks/scheduler.js`, `app/tasks/native_tasks.js` | [ ] |
@@ -285,6 +285,7 @@
   1. 修改 `server.js:2204-2216`：只有当 `this.account.enabled !== false && this.account.manualShutdown === true`（即之前是因电源关机联动暂时停了保活）且检测到桌面运行中时，才自动恢复 `features.keepAlive = true` 和清除 `manualShutdown = false`。
   2. 确保写入前初始化 `this.account.features = this.account.features || {};`；若 `this.account.features.keepAlive === false` 且 `!this.account.manualShutdown`，严禁擅自打开保活开关。
 - **验收**：用户手动关闭天翼云账号的「常态保活」开关后，即使机器在运行并刷新桌面列表，`features.keepAlive` 仍保持 `false`，不会自动复活。
+- **执行记录（2026-11-24）**：外部在线状态仅在账号未停用且 `manualShutdown === true` 的电源联动恢复场景才重新开启保活；安全初始化空 features，保留其他字段、电源状态判定及现有联动来源，恢复后清标记以避免同次列表多机重复启动。新增 2 项行为回归、3 项变异（M174–M176）；先复现 236 通过/2 失败（exit=1），修复后完整 `npm test` 为 238 通过/0 失败、18 个 JS 文件语法通过（exit=0），已做只读 review。未修改账号编辑或电源控制路由；完整阶段变异尚待 P1-06 后运行。
 
 ---
 

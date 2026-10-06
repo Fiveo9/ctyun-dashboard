@@ -1323,6 +1323,28 @@ const MUTATIONS = [
     from: 'data-username="${escapeHtml(u.username)}"',
     to: 'data-username="${u.username}"',
   },
+  {
+    id: 'M131',
+    name: 'P0-04：账号响应恢复下发内部凭据',
+    file: 'server.js',
+    from: 'return { ...rest, hasPassword: Boolean(password) };',
+    to: 'return { ...rest, password, savedLoginInfo, _smsCodeKey, hasPassword: Boolean(password) };',
+  },
+  {
+    id: 'M132',
+    name: 'P0-04：编辑分支重新读取明文账号密码',
+    file: 'app/static/app.js',
+    from: 'const isQrAccount = !acc.hasPassword;',
+    to: 'const isQrAccount = !acc.password;',
+  },
+  {
+    id: 'M133',
+    name: 'P0-04：留空密码重新加入编辑请求',
+    file: 'app/static/app.js',
+    from: '...(password ? { password } : {})',
+    to: 'password',
+    replaceAll: true,
+  },
 ];
 
 // ---------------------------------------------------------------------------

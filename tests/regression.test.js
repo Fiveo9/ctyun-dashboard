@@ -5519,7 +5519,8 @@ function makePhase1FrontendHarness(overrides = {}) {
     'bindAdminUserActions', 'buildOfficialTasksHtml', 'buildIntervalOverviewText',
     'buildYdpcVmMonitorHtml', 'buildEcloudDesktopMonitorHtml', 'ecloudViewTone',
     'formatYdpcRemainText', 'formatEcloudRemainText', 'htmlToPlainTitle',
-    'buildAccountCardElement', 'logLineInnerHtml', 'openAdminUsersModal'];
+    'buildAccountCardElement', 'logLineInnerHtml', 'openAdminUsersModal',
+    'editAccount', 'saveAccount', 'saveYdpcAccount', 'saveEcloudAccount'];
   const source = names.map(name => phase1FunctionFrom(phase1AppSource, name)).join('\n') + `\n({ ${names.join(', ')} })`;
   const api = vm.runInNewContext(source, { document: { createElement: element },
     activeEditingAccId: null, _icon: () => '', isDetailsOpen: () => false,
@@ -5631,6 +5632,105 @@ test('P0-03：三平台卡片与主机字段转义，开机委托保留名称，
   assert.strictEqual(invalid.id, payload, '安全校验不得重写配置标识');
   const invalidVm = api.buildAccountCardElement({ id: 'safe-account', platform: 'ydpc', user: 'test-user', vms: [{ userServiceId: payload, vmName: payload }] }, 0);
   assert.ok(!/<img/.test(invalidVm.innerHTML));
+});
+
+test('P0-04：账号脱敏保留业务字段与 hasPassword，原配置保持完整', () => {
+  const sanitize = new Function(`${phase1ServerFunction('sanitizeAccountForClient')}\nreturn sanitizeAccountForClient;`)();
+  const account = { id: 'safe-account', password: 'fixture-' + 1,
+    savedLoginInfo: { internal: true }, _smsCodeKey: 'fixture-' + 2, features: { keepAlive: false }, name: '备注' };
+  const result = sanitize(account);
+  for (const field of ['password', 'savedLoginInfo', '_smsCodeKey']) {
+    assert.strictEqual(Object.hasOwn(result, field), false, `${field} 不得下发`);
+    assert.strictEqual(Object.hasOwn(account, field), true, '脱敏不得改写原始配置');
+  }
+  assert.strictEqual(result.hasPassword, true);
+  assert.strictEqual(result.features, account.features);
+  assert.strictEqual(sanitize({ id: 'qr-account', password: '' }).hasPassword, false);
+  assert.ok(/enriched\.map\(sanitizeAccountForClient\)/.test(server));
+  assert.ok((server.match(/account: sanitizeAccountForClient\(/g) || []).length >= 6, '全部 account 响应字段必须经过脱敏');
+  assert.ok(!/jsonResponse\(res, (?:acc|newAcc)(?:,|\))/.test(server), '直接返回账号的接口也必须脱敏');
+  assert.ok(!/acc\.password/.test(phase1AppSource), '前端不得依赖明文账号密码');
+});
+
+testAsync('P0-04：三平台列表与更新实际响应不含凭据，空密码更新保留服务器原值', async () => {
+  const sanitize = new Function(`${phase1ServerFunction('sanitizeAccountForClient')}\nreturn sanitizeAccountForClient;`)();
+  const accounts = ['ctyun', 'ydpc', 'ecloud'].map((platform, index) => ({ id: 'account-' + index, platform,
+    password: 'fixture-' + index, savedLoginInfo: { internal: true }, _smsCodeKey: 'fixture-sms',
+    features: { keepAlive: false }, enabled: false, name: '原备注', desktops: [], vms: [],
+  }));
+  const clients = new Map(accounts.map(account => [account.id, { metrics: { desktops: [], vms: [], keepAliveSeconds: 60 },
+    stopKeepAliveWorker() {}, refreshVms: async () => [], refreshDesktops: async () => [],
+  }]));
+  let body = {};
+  const harness = makePhase1RouteHarness({ role: 'admin' }, { appConfig: { accounts, settings: {} },
+    getClient: account => clients.get(account.id), sanitizeAccountForClient: sanitize,
+    parseJsonBody: async () => body, canUserAccessAccount: () => true, saveConfig: () => {},
+  });
+  const list = harness.request('/api/accounts');
+  await list.run();
+  const response = JSON.parse(list.res.body);
+  assert.strictEqual(response.length, 3);
+  for (const account of response) {
+    assert.strictEqual(account.hasPassword, true);
+    assert.ok(!Object.hasOwn(account, 'password') && !Object.hasOwn(account, 'savedLoginInfo') && !Object.hasOwn(account, '_smsCodeKey'));
+  }
+  for (const account of accounts) {
+    const original = account.password;
+    body = { name: '新备注', password: '' };
+    const update = harness.request('/api/accounts/' + account.id, 'PUT');
+    await update.run();
+    assert.strictEqual(update.res.statusCode, 200);
+    assert.ok(account.password === original, '空密码必须保留原服务器凭据');
+    assert.strictEqual(account.name, '新备注');
+    assert.strictEqual(Object.hasOwn(JSON.parse(update.res.body), 'password'), false);
+  }
+});
+
+testAsync('P0-04：三平台编辑清空密码、空值不提交，新密码正常提交，新增仍要求密码', async () => {
+  const fields = new Map();
+  const getField = id => {
+    if (!fields.has(id)) fields.set(id, { value: '', style: {}, innerText: '',
+      options: [{ value: '300' }, { value: '600' }], focus() {}, select() {} });
+    return fields.get(id);
+  };
+  const accounts = ['ctyun', 'ydpc', 'ecloud'].map(platform => ({ id: platform + '-account', platform,
+    hasPassword: true, name: '原备注', user: 'test-user', keepaliveInterval: 600, features: { autoBoot: false } }));
+  for (const account of accounts) Object.defineProperty(account, 'password', { get() { throw new Error('前端不得读取密码字段'); } });
+  const calls = [];
+  const toasts = [];
+  const { api } = makePhase1FrontendHarness({ document: { getElementById: getField }, accounts,
+    pendingEcloudLogin: null, setTimeout: () => 0, resetEcloudSmsGroup() {},
+    switchAddAccountPlatform() {}, switchAccountLoginTab() {}, closeModal() {}, checkCurrentUser() {},
+    loadAccounts: async () => {}, showToast: (message, level) => toasts.push({ message, level }),
+    refreshModalCaptcha() {}, authFetch: async (url, options) => {
+      calls.push({ url, body: JSON.parse(options.body) });
+      return { ok: true, json: async () => ({ success: true }) };
+    },
+  });
+  const save = { ctyun: api.saveAccount, ydpc: api.saveYdpcAccount, ecloud: api.saveEcloudAccount };
+  const passwordField = { ctyun: 'acc-password', ydpc: 'ydpc-password', ecloud: 'ecloud-password' };
+  for (const account of accounts) {
+    for (const id of Object.values(passwordField)) getField(id).value = 'previous-input';
+    api.editAccount(account.id);
+    for (const id of Object.values(passwordField)) {
+      assert.strictEqual(getField(id).value, '');
+      assert.strictEqual(getField(id).placeholder, '已配置密码（留空则保持不变）');
+    }
+    await save[account.platform]();
+    const blank = calls[calls.length - 1];
+    assert.strictEqual(blank.url, '/api/accounts/' + account.id);
+    assert.strictEqual(Object.hasOwn(blank.body, 'password'), false, '留空不得发送 password 字段');
+    assert.strictEqual(blank.body.user, 'test-user');
+    getField(passwordField[account.platform]).value = 'replacement-input';
+    await save[account.platform]();
+    assert.ok(calls[calls.length - 1].body.password === 'replacement-input', '新输入密码必须正常发送');
+    const count = calls.length;
+    getField('acc-id').value = '';
+    getField(passwordField[account.platform]).value = '';
+    await save[account.platform]();
+    assert.strictEqual(calls.length, count, '新增账号空密码必须在请求前拒绝');
+  }
+  assert.strictEqual(toasts.filter(toast => toast.level === 'error').length, 3);
 });
 
 // ============================================================================

@@ -3485,6 +3485,12 @@ function jsonResponse(res, data, statusCode = 200) {
   res.end(JSON.stringify(data));
 }
 
+function sanitizeAccountForClient(acc) {
+  if (!acc || typeof acc !== 'object') return acc;
+  const { password, savedLoginInfo, _smsCodeKey, ...rest } = acc;
+  return { ...rest, hasPassword: Boolean(password) };
+}
+
 function escapeHtmlServer(str) {
   return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -4575,7 +4581,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         liveMetrics: client.metrics
       };
     });
-    jsonResponse(res, enriched);
+    jsonResponse(res, enriched.map(sanitizeAccountForClient));
     return;
   }
 
@@ -4744,7 +4750,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       client.startKeepAliveWorker();
 
       appendLog('SOHO', `[${name}] 移动云账号添加成功，发现 ${vms.length} 台云主机，已自动启动保活守护`, 'success', name, 'ydpc');
-      jsonResponse(res, { success: true, account: newAcc }, 201);
+      jsonResponse(res, { success: true, account: sanitizeAccountForClient(newAcc) }, 201);
     } catch (e) {
       jsonResponse(res, { error: e.message || '移动云认证失败' }, 400);
     }
@@ -4818,7 +4824,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         const desktops = await draftClient.refreshDesktops().catch(() => []);
         finalizeEcloudAccount(draftAcc, draftClient);
         appendLog(ECLOUD_LOG_SOURCE, `[${name}] 移动公众账号添加成功，发现 ${desktops.length} 台云电脑，已启动独立保活守护`, 'success', name, 'ecloud');
-        jsonResponse(res, { success: true, account: draftAcc, desktops }, 201);
+        jsonResponse(res, { success: true, account: sanitizeAccountForClient(draftAcc), desktops }, 201);
         return;
       }
 
@@ -4888,7 +4894,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         const desktops = await entry.client.refreshDesktops().catch(() => []);
         finalizeEcloudAccount(entry.acc, entry.client);
         appendLog(ECLOUD_LOG_SOURCE, `[${entry.acc.name}] 短信验证通过，移动公众账号添加成功（${desktops.length} 台云电脑）`, 'success', entry.acc.name, 'ecloud');
-        jsonResponse(res, { success: true, account: entry.acc, desktops }, 201);
+        jsonResponse(res, { success: true, account: sanitizeAccountForClient(entry.acc), desktops }, 201);
         return;
       }
       jsonResponse(res, { error: (r && r.error) || `验证未通过（${r && r.status}）` }, 400);
@@ -5061,7 +5067,7 @@ function rewardNeedsDesktop(prodId, prodType) {
     client.loginInfo = loginData;
     client.startKeepAliveWorker();
 
-    jsonResponse(res, newAcc, 201);
+    jsonResponse(res, sanitizeAccountForClient(newAcc), 201);
     return;
   }
 
@@ -5159,7 +5165,7 @@ function rewardNeedsDesktop(prodId, prodType) {
     else if (featureName === 'keepaliveInterval') featureCn = `独立保活周期 (${finalValue ? Math.round(finalValue/60) + '分钟' : '继承账号默认'})`;
 
     appendLog('System', `[${acc.name}] 已将云主机 [${vmKey}] 的【${featureCn}】更新为: ${finalValue ? (typeof finalValue === 'boolean' ? '开启' : finalValue + '秒') : '关闭/继承'}`, 'info');
-    jsonResponse(res, { success: true, target: updatedTarget, account: acc });
+    jsonResponse(res, { success: true, target: updatedTarget, account: sanitizeAccountForClient(acc) });
     return;
   }
 
@@ -5252,7 +5258,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       client.stopKeepAliveWorker();
     }
 
-    jsonResponse(res, acc);
+    jsonResponse(res, sanitizeAccountForClient(acc));
     return;
   }
 
@@ -5447,7 +5453,7 @@ function rewardNeedsDesktop(prodId, prodType) {
           jsonResponse(res, {
             success: true,
             codeStatus: 'authorize',
-            account: existingAcc,
+            account: sanitizeAccountForClient(existingAcc),
             isReAuth: true
           });
           return;
@@ -5526,7 +5532,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         jsonResponse(res, {
           success: true,
           codeStatus: 'authorize',
-          account: newAcc
+          account: sanitizeAccountForClient(newAcc)
         });
         return;
       }

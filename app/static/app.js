@@ -1503,7 +1503,7 @@ function buildAccountCardElement(acc, slotIndex) {
   // ====================================================
   let sessionBadge = '';
   if (acc.sessionExpired) {
-    sessionBadge = `<span class="badge badge-danger" style="cursor:pointer;" onclick="editAccount('${acc.id}')">${!acc.password ? '⚠️ 待扫码授权' : '⚠️ 会话失效'}</span>`;
+    sessionBadge = `<span class="badge badge-danger" style="cursor:pointer;" onclick="editAccount('${acc.id}')">${!acc.hasPassword ? '⚠️ 待扫码授权' : '⚠️ 会话失效'}</span>`;
   }
 
   const boundBadgeHtml = acc.bound
@@ -1749,8 +1749,8 @@ function buildAccountCardElement(acc, slotIndex) {
     <div class="card-actions">
       ${acc.sessionExpired ? `
         <button class="btn btn-danger btn-launch-full" onclick="editAccount('${acc.id}')" style="margin-bottom:4px;">
-          <span>${!acc.password ? '重新扫码授权' : '重新验证登录'}</span>
-          <span class="btn-subtext">${!acc.password ? '手机 App 扫码一键恢复' : '输验证码恢复'}</span>
+          <span>${!acc.hasPassword ? '重新扫码授权' : '重新验证登录'}</span>
+          <span class="btn-subtext">${!acc.hasPassword ? '手机 App 扫码一键恢复' : '输验证码恢复'}</span>
         </button>
       ` : ''}
       <div class="card-action-tools">
@@ -2830,7 +2830,7 @@ async function saveYdpcAccount() {
   const verificationCode = document.getElementById("ydpc-captcha-code") ? document.getElementById("ydpc-captcha-code").value.trim() : "";
   const randomCode = document.getElementById("ydpc-random-code") ? document.getElementById("ydpc-random-code").value.trim() : "";
 
-  if (!user || !password) {
+  if (!user || (!accId && !password)) {
     showToast("请输入移动爱家手机号和密码", "error");
     return;
   }
@@ -2854,7 +2854,7 @@ async function saveYdpcAccount() {
         body: JSON.stringify({
           name: name || user,
           user,
-          password,
+          ...(password ? { password } : {}),
           accountType,
           keepaliveInterval,
           features
@@ -2993,7 +2993,7 @@ async function saveEcloudAccount() {
     return submitEcloudSmsCode();
   }
 
-  if (!user || !password) {
+  if (!user || (!accId && !password)) {
     showToast("请输入移动公众账号与密码", "error");
     return;
   }
@@ -3005,7 +3005,7 @@ async function saveEcloudAccount() {
       const res = await authFetch(`/api/accounts/${accId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: name || user, user, password, keepaliveInterval })
+        body: JSON.stringify({ name: name || user, user, ...(password ? { password } : {}), keepaliveInterval })
       });
       const data = await res.json();
       if (res.ok) {
@@ -3163,6 +3163,13 @@ async function syncEcloudDesktops(accId) {
 function editAccount(accId) {
   const acc = accounts.find(a => a.id === accId);
   if (!acc) return;
+  for (const inputId of ['ecloud-password', 'ydpc-password', 'acc-password']) {
+    const input = document.getElementById(inputId);
+    if (input) {
+      input.value = '';
+      input.placeholder = acc.hasPassword ? '已配置密码（留空则保持不变）' : '请输入登录密码';
+    }
+  }
   document.getElementById("acc-id").value = acc.id;
 
   const platformTabs = document.getElementById("platform-tabs-container");
@@ -3172,11 +3179,9 @@ function editAccount(accId) {
     document.getElementById("modal-account-title").innerText = `编辑移动公众账号 [${acc.name || acc.user}]`;
     const ecNameEl = document.getElementById("ecloud-name");
     const ecUserEl = document.getElementById("ecloud-user");
-    const ecPwdEl = document.getElementById("ecloud-password");
     const ecIntEl = document.getElementById("ecloud-interval");
     if (ecNameEl) ecNameEl.value = acc.name || "";
     if (ecUserEl) ecUserEl.value = acc.user || "";
-    if (ecPwdEl) ecPwdEl.value = acc.password || "";
     if (ecIntEl) {
       const want = String(acc.keepaliveInterval || 300);
       const exists = Array.prototype.some.call(ecIntEl.options, o => o.value === want);
@@ -3195,20 +3200,18 @@ function editAccount(accId) {
     document.getElementById("modal-account-title").innerText = "编辑移动爱家账号";
     const nameEl = document.getElementById("ydpc-name");
     const userEl = document.getElementById("ydpc-user");
-    const pwdEl = document.getElementById("ydpc-password");
     const typeEl = document.getElementById("ydpc-account-type");
     const intEl = document.getElementById("ydpc-interval");
 
     if (nameEl) nameEl.value = acc.name || "";
     if (userEl) userEl.value = acc.user || "";
-    if (pwdEl) pwdEl.value = acc.password || "";
     if (typeEl) typeEl.value = acc.accountType || "main";
     if (intEl) intEl.value = String(acc.keepaliveInterval || 600);
 
     openModal("account-modal");
     switchAddAccountPlatform('ydpc');
   } else {
-    const isQrAccount = !acc.password;
+    const isQrAccount = !acc.hasPassword;
     if (isQrAccount) {
       document.getElementById("modal-account-title").innerText = acc.sessionExpired 
         ? `📱 重新扫码授权天翼云账号 [${acc.name || acc.user}]` 
@@ -3226,7 +3229,6 @@ function editAccount(accId) {
         : `编辑天翼云账号 [${acc.name || acc.user}]`;
       document.getElementById("acc-name").value = acc.name || "";
       document.getElementById("acc-user").value = acc.user || "";
-      document.getElementById("acc-password").value = acc.password || "";
       document.getElementById("acc-captcha-code").value = "";
       document.getElementById("acc-device-code").value = acc.deviceCode || "";
       const tabContainer = document.getElementById("acc-login-tabs");
@@ -3410,7 +3412,7 @@ async function saveAccount() {
   const challengeId = document.getElementById("acc-challenge-id").value.trim();
   const challengeCode = document.getElementById("acc-challenge-code").value.trim();
 
-  if (!user || !password) {
+  if (!user || (!accId && !password)) {
     showToast("手机号/账号与密码不能为空", "error");
     return;
   }
@@ -3429,7 +3431,7 @@ async function saveAccount() {
   const payload = {
     name: name || user,
     user,
-    password,
+    ...(password ? { password } : {}),
     deviceCode,
     captchaCode,
     challengeId,

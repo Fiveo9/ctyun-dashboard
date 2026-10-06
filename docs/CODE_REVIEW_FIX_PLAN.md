@@ -51,7 +51,7 @@
 | `P0-01` | P0 | `server.js` | 未鉴权接口补齐鉴权与开放代理/缓存限制 | `server.js` | [x] |
 | `P0-02` | P0 | `server.js` | 修复 SSRF 过滤绕过（IPv6 方括号/DNS 重绑定/302 跳转） | `server.js` | [x] |
 | `P0-03` | P0 | `app/static`, `server.js` | 消除存储型 XSS、属性注入与服务端 HTML/Script 注入 | `app/static/app.js`, `server.js` | [x] |
-| `P0-04` | P0 | `server.js`, `app/static` | API 响应剥离明文密码与会话密钥，编辑弹窗不再回填明文密码 | `server.js`, `app/static/app.js` | [ ] |
+| `P0-04` | P0 | `server.js`, `app/static` | API 响应剥离明文密码与会话密钥，编辑弹窗不再回填明文密码 | `server.js`, `app/static/app.js` | [x] |
 | `P0-05` | P0 | `app/ydpc` | 关闭 `cag_boot.js` 默认 wireLog 凭据泄露；恢复 `mqtt_client.js` TLS 校验 | `app/ydpc/cag_boot.js`, `app/ydpc/mqtt_client.js` | [ ] |
 | `P0-06` | P0 | `app/static` | 移除第三方二维码外链，本地生成扫码登录二维码 | `app/static/app.js`, `server.js` | [ ] |
 | `P0-07` | P0 | `auth_manager.js`, `sidecar.py`, 全局 | `scrypt` 密码哈希升级、改密吊销会话、`0600` 落盘与安全随机数 | `app/auth_manager.js`, `app/ecloud_engine/sidecar.py`, `native_tasks.js`, `soho_client.js`, `server.js` | [ ] |
@@ -187,6 +187,7 @@
   3. 前端 `app/static/app.js` 的 `editAccount()`（`:3170, :3195, :3220`）在编辑模式下将 `#ecloud-password`、`#ydpc-password`、`#acc-password` 置空，设置 `placeholder = acc.hasPassword ? "已配置密码（留空则保持不变）" : "请输入登录密码"`；保存函数（`saveAccount`、`saveYdpcAccount`、`saveEcloudAccount`）在编辑态若密码框为空，则**不**要求必填（对于只改备注/周期的编辑场景，如后端已存密码则不覆盖；仅当用户输入新密码时才随请求下发）。
   4. 检查 `app.js` 是否有地方读取 `acc.password`：搜索确认仅 `editAccount` 与表单保存读取，若展示逻辑有判定“是否账密登录”，改读 `acc.hasPassword`（或兼容 `acc.hasPassword || Boolean(acc.password)`）。
 - **验收**：打开浏览器 Network 面板查看 `/api/accounts` 响应，JSON 中不再出现 `password` 或 `savedLoginInfo` 字段；编辑账号不改密码直接保存仍可正常保活。
+- **执行记录（2026-11-24）**：列表、账号写接口、单机开关和扫码授权返回均经统一账号脱敏，剥离 password / savedLoginInfo / _smsCodeKey 并提供 hasPassword；原配置与显式备份导出分支保留。三平台编辑清空密码，留空不发送密码字段，新输入正常提交，新增仍要求密码。新增 3 项回归、3 项变异；完整回归 218 通过、0 失败，已做只读 review。
 
 ---
 

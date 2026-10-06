@@ -5384,6 +5384,127 @@ testAsync('P0-01：静态代理固定主机、路径校验以及 LRU 条目/字�
   }
 });
 
+function phase1FunctionFrom(source, name) {
+  const match = new RegExp('^(?:async )?function ' + name + '\\(', 'm').exec(source);
+  assert.ok(match, `必须能定位实际函数 ${name}`);
+  // 顶层结束括号独占一行；参数默认值 {} 不能当作函数体。
+  const end = source.indexOf('\n}', match.index) + 2;
+  assert.ok(end > match.index, `必须能完整抽取函数 ${name}`);
+  return source.slice(match.index, end);
+}
+
+function phase1ServerFunction(name) {
+  return phase1FunctionFrom(server, name);
+}
+
+function makePhase1PublicUrlHarness(overrides = {}) {
+  const vm = require('vm');
+  const names = ['isPrivateIpOrHost', 'splitWebhookSecret', 'isValidWebhookTarget',
+    'assertSafePublicUrl', 'requestPinnedPublicUrl', 'fetchSafeNotification', 'sendNotification'];
+  const source = names.map(phase1ServerFunction).join('\n') + `\n({ ${names.join(', ')} })`;
+  return vm.runInNewContext(source, { URL, URLSearchParams, Buffer, setTimeout, clearTimeout,
+    net: require('net'), crypto: require('crypto'),
+    dns: { promises: { lookup: async () => [{ address: '8.8.8.8', family: 4 }] } },
+    http: { request: () => { throw new Error('测试不得访问外网'); } },
+    https: { request: () => { throw new Error('测试不得访问外网'); } },
+    fetchWithTimeout: () => { throw new Error('测试必须提供隔离传输'); },
+    appendLog: () => {}, getBeijingTimeString: () => '2026-11-24 12:00:00',
+    ...overrides,
+  });
+}
+
+test('P0-02：IPv4/IPv6 等价私网、映射地址、CGNAT、组播及 URL 用户信息全部拒绝', () => {
+  const api = makePhase1PublicUrlHarness();
+  for (const target of [
+    'http://[::1]:8571/', 'http://[0:0:0:0:0:0:0:1]/', 'http://[::]/',
+    'http://[::ffff:127.0.0.1]/', 'http://[::ffff:7f00:1]/', 'http://[::ffff:a9fe:a9fe]/',
+    'http://169.254.169.254/', 'http://100.64.0.1/', 'http://100.127.255.255/',
+    'http://224.0.0.1/', 'http://255.255.255.255/', 'http://[fe9f::1]/',
+    'http://[febf::1]/', 'http://[fc12::1]/', 'http://[fdab::1]/', 'http://[ff02::1]/',
+    'http://localhost./', 'https://test-user@public.example/hook',
+  ]) assert.strictEqual(api.isValidWebhookTarget('webhook', target), false, '危险目标必须拒绝');
+  for (const target of ['https://8.8.8.8/', 'https://[::ffff:808:808]/', 'https://[2606:4700:4700::1111]/']) {
+    assert.strictEqual(api.isValidWebhookTarget('webhook', target), true, '正常公共地址必须保持可用');
+  }
+  assert.strictEqual(api.isPrivateIpOrHost('[fe80::1%eth0]'), true, 'Zone ID 不得绕过私网判定');
+  assert.strictEqual(api.isValidWebhookTarget('feishu', 'https://public.example/hook@sample-signature'), true);
+  assert.strictEqual(api.isValidWebhookTarget('feishu', 'https://test-user@public.example/hook'), false, 'authority 用户信息不得当作签名后缀剥离');
+});
+
+testAsync('P0-02：DNS 任一私网/空结果拒绝，连接固定校验地址，重定向和挂起请求拒绝', async () => {
+  const { EventEmitter } = require('events');
+  for (const answers of [[], [{ address: '8.8.8.8', family: 4 }, { address: '127.0.0.1', family: 4 }]]) {
+    const api = makePhase1PublicUrlHarness({ dns: { promises: { lookup: async () => answers } } });
+    await assert.rejects(api.assertSafePublicUrl('https://notify.example/hook'), /安全拦截/);
+  }
+  let dnsCalls = 0;
+  let connectedAddress;
+  let status = 200;
+  let stall = false;
+  const transport = {
+    request(url, options, callback) {
+      const request = new EventEmitter();
+      request.write = () => {};
+      request.destroy = error => { request.destroyed = true; if (error) request.emit('error', error); };
+      request.end = () => {
+        if (stall) return;
+        options.lookup(url.hostname, { all: true }, (error, addresses) => {
+          assert.ifError(error);
+          connectedAddress = addresses[0].address;
+        });
+        const response = new EventEmitter();
+        response.statusCode = status;
+        response.destroy = () => { response.destroyed = true; };
+        callback(response);
+        if (!response.destroyed) {
+          response.emit('data', Buffer.from('{"ok":true}'));
+          response.emit('end');
+        }
+      };
+      return request;
+    },
+  };
+  const api = makePhase1PublicUrlHarness({ https: transport,
+    dns: { promises: { lookup: async () => [{ address: ++dnsCalls === 1 ? '8.8.8.8' : '127.0.0.1', family: 4 }] } },
+  });
+  const safe = await api.assertSafePublicUrl('https://notify.example/hook');
+  const response = await api.requestPinnedPublicUrl(safe.url, { safePublicTarget: safe, redirect: 'error' }, 1000);
+  assert.strictEqual(response.ok, true);
+  assert.strictEqual(connectedAddress, '8.8.8.8', '实际连接必须使用已校验地址');
+  assert.strictEqual(dnsCalls, 1, '连接阶段不得再次解析 DNS');
+  status = 302;
+  await assert.rejects(api.requestPinnedPublicUrl(safe.url, { safePublicTarget: safe, redirect: 'error' }, 1000), /重定向/);
+  stall = true;
+  await assert.rejects(api.requestPinnedPublicUrl(safe.url, { safePublicTarget: safe, redirect: 'error' }, 20), /超时/);
+  assert.ok(/options\.safePublicTarget/.test(phase1ServerFunction('fetchWithTimeout')), '统一超时入口必须接入固定地址传输');
+});
+
+testAsync('P0-02：全部通知渠道经过 DNS 校验、禁止重定向和 15 秒预算，飞书签名后缀不发往 URL', async () => {
+  const calls = [];
+  const api = makePhase1PublicUrlHarness({ fetchWithTimeout: async (url, options, timeout) => {
+    calls.push({ url, options, timeout });
+    return { ok: true, status: 200, json: async () => ({ errcode: 0, code: 0 }) };
+  } });
+  const targets = {
+    webhook: 'https://notify.example/hook', qywx: 'https://notify.example/hook',
+    dingtalk: 'https://notify.example/hook', feishu: 'https://notify.example/hook@sample-signature',
+    serverchan: 'TEST_SENDKEY_123456', pushplus: 'TEST_PUSHKEY_123456',
+    bark: 'https://notify.example/device', telegram: '123456:TEST_BOT_VALUE@12345',
+  };
+  for (const [channel, webhookUrl] of Object.entries(targets)) {
+    const result = await api.sendNotification({ notify: { enabled: true, channel, webhookUrl } }, '测试', '内容');
+    assert.strictEqual(result.success, true, `${channel} 应保留原有成功语义`);
+  }
+  assert.strictEqual(calls.length, 8);
+  for (const call of calls) {
+    assert.strictEqual(call.options.redirect, 'error');
+    assert.strictEqual(call.timeout, 15000);
+    assert.strictEqual(call.options.safePublicTarget.url, new URL(call.url).href);
+  }
+  assert.strictEqual(calls[3].url, 'https://notify.example/hook', '飞书请求 URL 必须剥离签名后缀');
+  assert.ok(!/(?<![\w$])fetch\s*\(/.test(stripLineComments(phase1ServerFunction('sendNotification'))), '通知不得绕过统一安全入口');
+});
+
 // ============================================================================
 // 汇总输出（先跑完全部异步断言，再统一出结果）
 // ============================================================================

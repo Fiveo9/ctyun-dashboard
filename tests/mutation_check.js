@@ -1274,6 +1274,27 @@ const MUTATIONS = [
     from: 'const CTYUN_STATIC_MAX_BYTES = 32 * 1024 * 1024;',
     to: 'const CTYUN_STATIC_MAX_BYTES = 1024 * 1024 * 1024;',
   },
+  {
+    id: 'M124',
+    name: 'P0-02：CGNAT 私网限制被撤销',
+    file: 'server.js',
+    from: 'if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true;',
+    to: 'if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return false;',
+  },
+  {
+    id: 'M125',
+    name: 'P0-02：通知重定向拒绝被撤销',
+    file: 'server.js',
+    from: 'if (response.statusCode >= 300 && response.statusCode < 400) {',
+    to: 'if (false) {',
+  },
+  {
+    id: 'M126',
+    name: 'P0-02：连接地址不再固定到已校验 DNS 结果',
+    file: 'server.js',
+    from: 'const candidates = publicTarget.addresses.filter(addr => !lookupOptions.family || addr.family === lookupOptions.family);',
+    to: "const candidates = [{ address: '127.0.0.1', family: 4 }];",
+  },
 ];
 
 // ---------------------------------------------------------------------------

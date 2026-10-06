@@ -463,6 +463,7 @@ function md5(str) {
 
 // 带超时保护的网络请求 (防止天翼云网关偶发挂起导致保活循环永久阻塞)
 async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
+  if (options.safePublicTarget) return requestPinnedPublicUrl(url, options, timeoutMs);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -485,10 +486,10 @@ function generateDeviceCode() {
 
 // SSRF 防护：校验 URL 是否为安全的外部公共 HTTP/HTTPS 地址
 function isPrivateIpOrHost(hostname) {
-  const h = (hostname || '').toLowerCase().trim();
+  const h = String(hostname || '').toLowerCase().trim().replace(/^\[|\]$/g, '').split('%')[0].replace(/\.+$/, '');
   if (!h) return true;
   if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0') return true;
-  if (h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.lan')) return true;
+  if (h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.lan')) return true;
 
   if (net.isIPv4(h)) {
     const parts = h.split('.').map(Number);
@@ -498,15 +499,42 @@ function isPrivateIpOrHost(hostname) {
     if (parts[0] === 192 && parts[1] === 168) return true; // 192.168.0.0/16 private
     if (parts[0] === 169 && parts[1] === 254) return true; // 169.254.0.0/16 link-local / cloud metadata
     if (parts[0] === 0) return true;   // 0.0.0.0/8 current network
+    if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true; // CGNAT 100.64.0.0/10
+    if (parts[0] >= 224) return true; // multicast / reserved
   }
 
   if (net.isIPv6(h)) {
-    if (h === '::1' || h === '::') return true;
-    if (h.startsWith('fe80:')) return true; // link-local
-    if (h.startsWith('fc00:') || h.startsWith('fd00:')) return true; // ULA
+    let normalized = h;
+    if (h.includes('.')) {
+      const lastColon = h.lastIndexOf(':');
+      const v4 = h.slice(lastColon + 1).split('.').map(Number);
+      normalized = h.slice(0, lastColon + 1)
+        + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16);
+    }
+    const halves = normalized.split('::');
+    const left = halves[0] ? halves[0].split(':').map(x => parseInt(x, 16)) : [];
+    const right = halves[1] ? halves[1].split(':').map(x => parseInt(x, 16)) : [];
+    const words = halves.length === 1 ? left : [...left, ...Array(8 - left.length - right.length).fill(0), ...right];
+    if (words.slice(0, 5).every(x => x === 0) && words[5] === 0xffff) {
+      return isPrivateIpOrHost([words[6] >> 8, words[6] & 255, words[7] >> 8, words[7] & 255].join('.'));
+    }
+    if (words.slice(0, 6).every(x => x === 0)) return true; // unspecified / loopback / obsolete IPv4-compatible
+    if ((words[0] & 0xffc0) === 0xfe80 || (words[0] & 0xffc0) === 0xfec0) return true;
+    if ((words[0] & 0xfe00) === 0xfc00 || (words[0] & 0xff00) === 0xff00) return true;
   }
 
   return false;
+}
+
+function splitWebhookSecret(channel, rawTarget) {
+  const target = String(rawTarget || '').trim();
+  const authorityStart = target.indexOf('://') + 3;
+  const pathStart = target.indexOf('/', authorityStart);
+  const suffixStart = pathStart < 0 ? -1 : target.indexOf(channel === 'dingtalk' ? '@SEC' : '@', pathStart);
+  if ((channel === 'feishu' || channel === 'dingtalk') && suffixStart >= 0) {
+    return { url: target.slice(0, suffixStart).trim(), secret: target.slice(suffixStart + 1).trim() };
+  }
+  return { url: target, secret: '' };
 }
 
 function isValidWebhookTarget(channel, rawTarget) {
@@ -531,10 +559,11 @@ function isValidWebhookTarget(channel, rawTarget) {
 
   // URL 型推送渠道 (webhook, qywx, dingtalk, feishu, bark)
   try {
-    // 剥离可能附带的 @SEC... 密钥后缀以供 URL 校验
-    const checkUrl = target.split('@SEC')[0].trim();
+    // 仅剥离支持渠道的路径后缀；URL authority 中的用户信息仍必须拒绝。
+    const checkUrl = splitWebhookSecret(ch, target).url;
     const u = new URL(checkUrl);
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+    if (u.username || u.password) return false;
     if (isPrivateIpOrHost(u.hostname)) return false;
     return true;
   } catch (e) {
@@ -544,6 +573,107 @@ function isValidWebhookTarget(channel, rawTarget) {
 
 function isValidWebhookUrl(rawUrl) {
   return isValidWebhookTarget('webhook', rawUrl);
+}
+
+async function assertSafePublicUrl(rawUrl) {
+  const u = new URL(rawUrl);
+  if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password || isPrivateIpOrHost(u.hostname)) {
+    throw new Error('安全拦截：通知目标必须是公共 HTTP/HTTPS 地址');
+  }
+  const hostname = u.hostname.replace(/^\[|\]$/g, '');
+  let addresses;
+  if (net.isIP(hostname)) {
+    addresses = [{ address: hostname, family: net.isIP(hostname) }];
+  } else {
+    let lookupTimer;
+    try {
+      addresses = await Promise.race([
+        dns.promises.lookup(hostname, { all: true }),
+        new Promise((resolve, reject) => { lookupTimer = setTimeout(() => reject(new Error('通知目标 DNS 解析超时')), 15000); }),
+      ]);
+    } finally { clearTimeout(lookupTimer); }
+  }
+  if (!addresses.length || addresses.some(addr => !net.isIP(addr.address) || isPrivateIpOrHost(addr.address))) {
+    throw new Error('安全拦截：通知目标解析到私有/保留地址');
+  }
+  return Object.freeze({ url: u.href, hostname,
+    addresses: Object.freeze(addresses.map(addr => Object.freeze({ address: addr.address, family: net.isIP(addr.address) }))),
+  });
+}
+
+function requestPinnedPublicUrl(rawUrl, options, timeoutMs) {
+  const target = new URL(rawUrl);
+  const publicTarget = options.safePublicTarget;
+  if (!publicTarget || publicTarget.url !== target.href || !publicTarget.addresses.length
+      || publicTarget.addresses.some(addr => isPrivateIpOrHost(addr.address))) {
+    return Promise.reject(new Error('安全拦截：缺少已验证的通知目标'));
+  }
+  // DNS 校验与实际连接使用同一组地址，避免第二次解析被重绑定到内网。
+  return new Promise((resolve, reject) => {
+    let request;
+    let timer;
+    let settled = false;
+    const finish = (error, response) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(response);
+    };
+    try {
+      const transport = target.protocol === 'https:' ? https : http;
+      request = transport.request(target, {
+        method: options.method || 'GET', headers: options.headers || {},
+        lookup: (hostname, lookupOptions, callback) => {
+          if (hostname.replace(/^\[|\]$/g, '') !== publicTarget.hostname) {
+            callback(new Error('通知连接主机与校验目标不一致'));
+            return;
+          }
+          const candidates = publicTarget.addresses.filter(addr => !lookupOptions.family || addr.family === lookupOptions.family);
+          if (!candidates.length) { callback(new Error('通知目标没有匹配的公共地址')); return; }
+          if (lookupOptions.all) callback(null, candidates);
+          else callback(null, candidates[0].address, candidates[0].family);
+        },
+      }, response => {
+        if (response.statusCode >= 300 && response.statusCode < 400) {
+          finish(new Error('安全拦截：通知目标禁止重定向'));
+          response.destroy();
+          request.destroy();
+          return;
+        }
+        const chunks = [];
+        let bytes = 0;
+        response.on('error', error => finish(error));
+        response.on('data', chunk => {
+          bytes += chunk.length;
+          if (bytes > 1024 * 1024) {
+            finish(new Error('通知响应超过大小上限'));
+            response.destroy();
+            request.destroy();
+            return;
+          }
+          chunks.push(Buffer.from(chunk));
+        });
+        response.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          finish(null, { ok: response.statusCode >= 200 && response.statusCode < 300,
+            status: response.statusCode, text: async () => text, json: async () => JSON.parse(text) });
+        });
+      });
+      request.on('error', error => finish(error));
+      timer = setTimeout(() => {
+        const error = new Error('通知请求超时');
+        finish(error);
+        request.destroy(error);
+      }, timeoutMs);
+      if (options.body) request.write(options.body);
+      request.end();
+    } catch (error) { finish(error); }
+  });
+}
+
+async function fetchSafeNotification(url, options = {}) {
+  const safePublicTarget = await assertSafePublicUrl(url);
+  return fetchWithTimeout(url, { ...options, redirect: 'error', safePublicTarget }, 15000);
 }
 
 // 资源归属权鉴权辅助：确保用户只能管理自己名下的账号，admin 可管理全部
@@ -562,7 +692,7 @@ async function sendNotification(settings, title, content, extraVars = {}) {
 
   // SSRF 安全防御与有效性校验
   if (notify.webhookUrl && !isValidWebhookTarget(channel, notify.webhookUrl)) {
-    appendLog('Notify', `[安全拦截] 拒绝向私有/内网或非法协议地址发送 Webhook: ${notify.webhookUrl}`, 'error');
+    appendLog('Notify', '[安全拦截] 拒绝向私有/内网或非法协议地址发送 Webhook', 'error');
     return { success: false, message: '安全拦截：禁止向内网/本地私有地址或非法格式发送推送' };
   }
   
@@ -589,7 +719,7 @@ async function sendNotification(settings, title, content, extraVars = {}) {
 
   try {
     if (channel === 'webhook' && notify.webhookUrl) {
-      const res = await fetch(notify.webhookUrl, {
+      const res = await fetchSafeNotification(notify.webhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title: finalTitle, content: finalContent, time: vars['{time}'] })
@@ -603,7 +733,7 @@ async function sendNotification(settings, title, content, extraVars = {}) {
           content: `### ${finalTitle}\n\n${finalContent}\n\n> 触发时间: ${vars['{time}']}`
         }
       };
-      const res = await fetch(notify.webhookUrl, {
+      const res = await fetchSafeNotification(notify.webhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(qywxPayload)
@@ -621,9 +751,9 @@ async function sendNotification(settings, title, content, extraVars = {}) {
 
       // 2. 支持从 URL 中智能提取加签密钥: 如 https://oapi.dingtalk.com/robot/send?access_token=xxx&secret=SECxxx 或 url@SECxxx
       if (dingUrl.includes('@SEC')) {
-        const parts = dingUrl.split('@');
-        dingUrl = parts[0].trim();
-        dingSecret = dingSecret || parts[1].trim();
+        const split = splitWebhookSecret('dingtalk', dingUrl);
+        dingUrl = split.url;
+        dingSecret = dingSecret || split.secret;
       } else if (dingUrl.includes('secret=')) {
         try {
           const u = new URL(dingUrl);
@@ -654,7 +784,7 @@ async function sendNotification(settings, title, content, extraVars = {}) {
           text: `### ${finalTitle}\n\n${finalContent}\n\n> 触发时间: ${vars['{time}']}`
         }
       };
-      const res = await fetch(dingUrl, {
+      const res = await fetchSafeNotification(dingUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(dingPayload)
@@ -679,9 +809,9 @@ async function sendNotification(settings, title, content, extraVars = {}) {
 
       // 支持从 URL 提取 secret: url@secret
       if (feishuUrl.includes('@')) {
-        const parts = feishuUrl.split('@');
-        feishuUrl = parts[0].trim();
-        feishuSecret = feishuSecret || parts[1].trim();
+        const split = splitWebhookSecret('feishu', feishuUrl);
+        feishuUrl = split.url;
+        feishuSecret = feishuSecret || split.secret;
       }
 
       const feishuPayload = {
@@ -713,7 +843,7 @@ async function sendNotification(settings, title, content, extraVars = {}) {
         feishuPayload.timestamp = timestamp;
         feishuPayload.sign = sign;
       }
-      const res = await fetch(notify.webhookUrl, {
+      const res = await fetchSafeNotification(feishuUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(feishuPayload)
@@ -723,14 +853,14 @@ async function sendNotification(settings, title, content, extraVars = {}) {
       return { success: isOk, message: feishuData.msg || feishuData.StatusMessage || `HTTP ${res.status}` };
     } else if (channel === 'serverchan' && notify.webhookUrl) {
       const url = `https://sctapi.ftqq.com/${notify.webhookUrl}.send`;
-      const res = await fetch(url, {
+      const res = await fetchSafeNotification(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({ title: finalTitle, desp: finalContent }).toString()
       });
       return { success: res.ok, message: `HTTP ${res.status}` };
     } else if (channel === 'pushplus' && notify.webhookUrl) {
-      const res = await fetch('http://www.pushplus.plus/send', {
+      const res = await fetchSafeNotification('http://www.pushplus.plus/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: notify.webhookUrl, title: finalTitle, content: finalContent })
@@ -738,12 +868,12 @@ async function sendNotification(settings, title, content, extraVars = {}) {
       return { success: res.ok, message: `HTTP ${res.status}` };
     } else if (channel === 'bark' && notify.webhookUrl) {
       const base = notify.webhookUrl.replace(/\/+$/, '');
-      const res = await fetch(`${base}/${encodeURIComponent(finalTitle)}/${encodeURIComponent(finalContent)}`);
+      const res = await fetchSafeNotification(`${base}/${encodeURIComponent(finalTitle)}/${encodeURIComponent(finalContent)}`);
       return { success: res.ok, message: `HTTP ${res.status}` };
     } else if (channel === 'telegram' && notify.webhookUrl) {
       const [botToken, chatId] = notify.webhookUrl.split('@');
       if (botToken && chatId) {
-        const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        const res = await fetchSafeNotification(`https://api.telegram.org/bot${botToken}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ chat_id: chatId, text: `*${finalTitle}*\n\n${finalContent}`, parse_mode: 'Markdown' })

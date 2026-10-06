@@ -49,7 +49,7 @@
 | ID | 优先级 | 模块 | 任务简述 | 主要涉及文件 | 状态 |
 | :--- | :--- | :--- | :--- | :--- | :---: |
 | `P0-01` | P0 | `server.js` | 未鉴权接口补齐鉴权与开放代理/缓存限制 | `server.js` | [x] |
-| `P0-02` | P0 | `server.js` | 修复 SSRF 过滤绕过（IPv6 方括号/DNS 重绑定/302 跳转） | `server.js` | [ ] |
+| `P0-02` | P0 | `server.js` | 修复 SSRF 过滤绕过（IPv6 方括号/DNS 重绑定/302 跳转） | `server.js` | [x] |
 | `P0-03` | P0 | `app/static`, `server.js` | 消除存储型 XSS、属性注入与服务端 HTML/Script 注入 | `app/static/app.js`, `server.js` | [ ] |
 | `P0-04` | P0 | `server.js`, `app/static` | API 响应剥离明文密码与会话密钥，编辑弹窗不再回填明文密码 | `server.js`, `app/static/app.js` | [ ] |
 | `P0-05` | P0 | `app/ydpc` | 关闭 `cag_boot.js` 默认 wireLog 凭据泄露；恢复 `mqtt_client.js` TLS 校验 | `app/ydpc/cag_boot.js`, `app/ydpc/mqtt_client.js` | [ ] |
@@ -127,6 +127,7 @@
   3. 新增 `async function assertSafePublicUrl(rawUrl)`：调用 `await dns.promises.lookup(hostname, { all: true })`（若非 IP 字面量），若解析为空或任一返回 IP 命中 `isPrivateIpOrHost(addr.address)` 则抛出拦截异常。
   4. 在 `sendNotification` 真正发请求前对目标 URL 调用 `await assertSafePublicUrl(...)`，并将所有裸 `fetch(...)` 统一改为 `fetchWithTimeout(url, { ..., redirect: 'error' }, 15000)`。
 - **验收**：对 `http://[::1]:8571/`、`http://[::ffff:127.0.0.1]/`、`http://[::ffff:7f00:1]/`、`http://169.254.169.254/`、`http://100.64.0.1/` 调用 `isValidWebhookTarget('webhook', url)` 全部返回 `false`。
+- **执行记录（2026-11-24）**：已补齐 IPv4/IPv6 私网与保留地址校验、DNS 全结果校验及连接地址固定；全部通知渠道经统一安全入口，禁止重定向并限制 15 秒请求预算，飞书路径签名后缀在校验和发请求时一致剥离。新增 3 项回归、3 项变异；完整回归 211 通过、0 失败，已做只读 review。
 
 ---
 

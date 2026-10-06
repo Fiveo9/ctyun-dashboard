@@ -5,6 +5,22 @@
 
 const tls = require('tls');
 const crypto = require('crypto');
+const net = require('net');
+
+const MQTT_CERT_CHAIN_ERROR_CODES = new Set([
+  'CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'UNABLE_TO_GET_ISSUER_CERT', 'ERR_TLS_CERT_ALTNAME_INVALID',
+]);
+
+function mqttCertChainError(error) {
+  const seen = new Set();
+  for (let current = error; current && !seen.has(current); current = current.cause) {
+    seen.add(current);
+    if (MQTT_CERT_CHAIN_ERROR_CODES.has(current.code)) return current.code;
+  }
+  return null;
+}
 
 function encodeRemainingLength(length) {
   const buffer = [];
@@ -71,6 +87,7 @@ class MqttKeepAliveClient {
     this.password = options.password || '';
     this.keepAliveSeconds = Number(options.keepAliveSeconds) || 60;
     this.onLog = options.onLog || console.log;
+    this.allowInsecure = options.allowInsecure === true;
 
     this.socket = null;
     this.isConnected = false;
@@ -101,7 +118,7 @@ class MqttKeepAliveClient {
       });
     });
 
-    return new Promise((resolve, reject) => {
+    const attempt = (allowInsecure) => new Promise((resolve, reject) => {
       let isResolved = false;
       const timeout = setTimeout(() => {
         if (!isResolved) {
@@ -115,11 +132,12 @@ class MqttKeepAliveClient {
         const tlsOptions = {
           host: targetIp,
           port: this.port,
-          servername: this.host, // 保持原始 host 用于 TLS SNI 证书合法性校验
-          rejectUnauthorized: false
         };
+        if (net.isIP(this.host) === 0) tlsOptions.servername = this.host;
+        if (allowInsecure) tlsOptions.rejectUnauthorized = false;
 
-        this.socket = tls.connect(tlsOptions, () => {
+        const socket = tls.connect(tlsOptions, () => {
+          if (this.socket !== socket) return;
           // TLS 链路建立成功，立即发送 MQTT 3.1.1 CONNECT 报文
           const connectPacket = buildMqttConnectPacket(
             this.clientId,
@@ -127,12 +145,14 @@ class MqttKeepAliveClient {
             this.password,
             this.keepAliveSeconds
           );
-          this.socket.write(connectPacket);
+          socket.write(connectPacket);
         });
+        this.socket = socket;
 
         let recvBuf = Buffer.alloc(0);
 
-        this.socket.on('data', (chunk) => {
+        socket.on('data', (chunk) => {
+          if (this.socket !== socket) return;
           recvBuf = Buffer.concat([recvBuf, chunk]);
 
           // 处理 CONNACK (0x20, 0x02, [flags], [returnCode])
@@ -178,16 +198,17 @@ class MqttKeepAliveClient {
           }
         });
 
-        this.socket.on('error', (err) => {
+        socket.on('error', (err) => {
           clearTimeout(timeout);
           if (!isResolved) {
             isResolved = true;
             reject(err);
           }
-          this.isConnected = false;
+          if (this.socket === socket) this.isConnected = false;
         });
 
-        this.socket.on('close', () => {
+        socket.on('close', () => {
+          if (this.socket !== socket) return;
           this.isConnected = false;
           if (this.pingTimer) {
             clearInterval(this.pingTimer);
@@ -206,6 +227,17 @@ class MqttKeepAliveClient {
         }
       }
     });
+
+    try {
+      return await attempt(false);
+    } catch (error) {
+      const certCode = mqttCertChainError(error);
+      if (!this.allowInsecure || this.isClosedManually || !certCode) throw error;
+      this.onLog('MQTT', `TLS 严格校验失败（host=${this.host}:${this.port}, code=${certCode}）；已按显式 allowInsecure 设置受控降级重试一次`, 'warning');
+      this.disconnect();
+      this.isClosedManually = false;
+      return attempt(true);
+    }
   }
 
   /**

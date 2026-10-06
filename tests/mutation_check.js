@@ -1345,6 +1345,34 @@ const MUTATIONS = [
     to: 'password',
     replaceAll: true,
   },
+  {
+    id: 'M134',
+    name: 'P0-05：CAG 默认重新开启报文日志',
+    file: 'app/ydpc/cag_boot.js',
+    from: 'const wire = opts.wireLog === true ? makeWireLogger(onLog) : null;',
+    to: 'const wire = opts.wireLog !== false ? makeWireLogger(onLog) : null;',
+  },
+  {
+    id: 'M135',
+    name: 'P0-05：CAG query 不再脱敏',
+    file: 'app/ydpc/cag_boot.js',
+    from: 'function redactQueryString(value) {',
+    to: 'function redactQueryString(value) { return String(value);',
+  },
+  {
+    id: 'M136',
+    name: 'P0-05：MQTT 无条件关闭证书校验',
+    file: 'app/ydpc/mqtt_client.js',
+    from: 'if (allowInsecure) tlsOptions.rejectUnauthorized = false;',
+    to: 'tlsOptions.rejectUnauthorized = false;',
+  },
+  {
+    id: 'M137',
+    name: 'P0-05：MQTT 非证书错误也允许降级',
+    file: 'app/ydpc/mqtt_client.js',
+    from: 'if (!this.allowInsecure || this.isClosedManually || !certCode) throw error;',
+    to: 'if (!this.allowInsecure || this.isClosedManually) throw error;',
+  },
 ];
 
 // ---------------------------------------------------------------------------

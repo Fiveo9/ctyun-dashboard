@@ -161,7 +161,7 @@ function makeWireLogger(onLog) {
   if (typeof onLog !== 'function') return null;
   return (msg, level = 'info') => {
     try {
-      onLog('CAG', msg, level);
+      onLog('CAG', redactForLog(msg), level);
     } catch (e) {
       // 日志回调自身异常不得影响主流程
     }
@@ -169,7 +169,17 @@ function makeWireLogger(onLog) {
 }
 
 // 需要在日志中脱敏的字段名
-const SENSITIVE_KEYS = ['password', 'accessToken', 'token', 'vmPassword', 'secret'];
+const SENSITIVE_KEYS = ['password', 'accessToken', 'token', 'vmPassword', 'secret',
+  'ZTE_Security_Params', 'connectStr', 'secretKey', 'access_token', 'authorization', 'cookie'];
+
+function redactQueryString(value) {
+  return String(value ?? '').replace(/(^|[?&;\s])([^=\s?&;]+)=([^&;\s#]*)/g, (match, prefix, key) => {
+    let decodedKey = key;
+    try { decodedKey = decodeURIComponent(key.replace(/\+/g, ' ')); } catch (e) { /* 保留非法键用于排障 */ }
+    return SENSITIVE_KEYS.some(name => decodedKey.toLowerCase() === name.toLowerCase())
+      ? `${prefix}${key}=<redacted>` : match;
+  });
+}
 
 /**
  * 对请求/响应体做脱敏，保留结构。过长时截断。
@@ -190,11 +200,21 @@ function redactForLog(value, maxLen = 1200) {
       }
       return out;
     }
+    if (typeof v === 'string') {
+      try {
+        const parsed = JSON.parse(v);
+        if (parsed && typeof parsed === 'object') return JSON.stringify(walk(parsed));
+        if (typeof parsed === 'string') return JSON.stringify(redactQueryString(parsed));
+      } catch (e) { /* 非 JSON 字符串仍需剥离 query 和截断 JSON 中的凭据 */ }
+      const jsonFields = new RegExp('("(?:' + SENSITIVE_KEYS.join('|') + ')"\\s*:\\s*)"(?:\\\\.|[^"\\\\])*(?:"|$)', 'gi');
+      return redactQueryString(v).replace(jsonFields, '$1"<redacted>"');
+    }
     return v;
   };
   let text;
   try {
-    text = typeof value === 'string' ? value : JSON.stringify(walk(value));
+    const redacted = walk(value);
+    text = typeof redacted === 'string' ? redacted : JSON.stringify(redacted);
   } catch (e) {
     text = String(value);
   }
@@ -723,7 +743,7 @@ function cagHttpsRequest(host, port, pathWithQuery, body, timeoutMs = DEFAULT_RE
 
     const startedAt = Date.now();
     if (wireLog) {
-      wireLog(`→ POST https://${host}:${port}${pathWithQuery}`, 'info');
+      wireLog(`→ POST https://${host}:${port}${redactQueryString(pathWithQuery)}`, 'info');
       wireLog(`  请求体 (${payloadBuf.length}B): ${redactForLog(payload)}`, 'info');
     }
 
@@ -777,7 +797,7 @@ function cagHttpsRequest(host, port, pathWithQuery, body, timeoutMs = DEFAULT_RE
       );
 
       req.on('timeout', () => {
-        if (wireLog) wireLog(`✖ 请求超时 (${timeoutMs}ms)：POST ${pathWithQuery}`, 'error');
+        if (wireLog) wireLog(`✖ 请求超时 (${timeoutMs}ms)：POST ${redactQueryString(pathWithQuery)}`, 'error');
         req.destroy(new Error(`CAG 请求超时 (${timeoutMs}ms)`));
       });
       req.on('error', (err) => {
@@ -802,12 +822,13 @@ function cagHttpsRequest(host, port, pathWithQuery, body, timeoutMs = DEFAULT_RE
       const warnKey = `${host}:${port}`;
       if (!_certChainWarned.has(warnKey)) {
         _certChainWarned.add(warnKey);
-        if (wireLog) {
-          wireLog(
+        const warningLog = session?.securityLog || wireLog;
+        if (warningLog) {
+          warningLog(
             `⚠️ TLS 证书链验证失败 (code=${certCode})：${describeErr(err)}`,
             'warning'
           );
-          wireLog(
+          warningLog(
             `⚠️ 判定为"服务端证书链不完整"（同一 CAG 端点的 ZTEC 保活走裸 TCP，不经 TLS）。` +
             `已对该请求降级重试（host=${host}:${port}）。此降级仅针对证书链缺陷，不代表放弃校验策略。` +
             `【该端点后续请求将静默降级，不再重复告警；重启后重新留证一次】`,
@@ -837,7 +858,7 @@ function cagHttpsRequest(host, port, pathWithQuery, body, timeoutMs = DEFAULT_RE
  * @param {function} opts.onLog  日志回调 (label, message, level)
  * @param {number} opts.bootWait 等待桌面就绪上限（秒），默认 180
  * @param {number} opts.timeout  单次请求超时（毫秒），默认 15000
- * @param {boolean} opts.wireLog 是否打印报文级日志，默认 true
+ * @param {boolean} opts.wireLog 是否打印报文级日志，默认 false，排障时显式开启
  * @param {number} opts.connectRetries CAG2.0 下 async_query 404 时重试 connectDesktop 次数
  * @returns {Promise<{success: boolean, message: string, connectStr?: string, accessToken?: string, waitedSeconds?: number}>}
  */
@@ -845,13 +866,13 @@ async function cagBootVm(firmAuth, opts = {}) {
   const onLog = typeof opts.onLog === 'function' ? opts.onLog : () => {};
   const bootWait = Number.isFinite(opts.bootWait) ? opts.bootWait : DEFAULT_BOOT_WAIT;
   const reqTimeout = Number.isFinite(opts.timeout) ? opts.timeout : DEFAULT_REQ_TIMEOUT;
-  // 报文级日志默认开启（首跑排障期），可通过 opts.wireLog = false 关闭
-  const wire = opts.wireLog === false ? null : makeWireLogger(onLog);
+  // 报文级日志仅在排障时显式开启；凭据脱敏始终生效。
+  const wire = opts.wireLog === true ? makeWireLogger(onLog) : null;
 
   // 【2026-09-23】整个开机流程共享一个会话容器。
   // CAG 服务端用会话状态串联"查配置 → 取 token → 提交连接 → 轮询"几步；
   // 若不传 Cookie，cs_connectDesktop 会直接拒绝：7090003 "Client need query system configuration again"。
-  const session = { cookies: {} };
+  const session = { cookies: {}, securityLog: makeWireLogger(onLog) };
 
   const cagHost = String(firmAuth?.cagIp || firmAuth?.cagHost || '');
   const cagPort = Number(firmAuth?.cagPort) || DEFAULT_CAG_PORT;
@@ -1195,7 +1216,7 @@ function describeErr(err) {
     parts.push(`[${i}] ${bits.join(' ')}`);
     cur = cur.cause;
   }
-  return parts.join(' → ');
+  return redactForLog(parts.join(' → '));
 }
 
 /** 解析 connectStr 解密后的命令行，取出 session-key / 地址 / 端口。 */
@@ -1257,6 +1278,7 @@ module.exports = {
   parseConnectCommand,
   localIdentity,
   redactForLog,
+  redactQueryString,
   isCertChainError,
   CERT_CHAIN_ERROR_CODES,
   CSAP_TOKEN_RETRY_CODES,

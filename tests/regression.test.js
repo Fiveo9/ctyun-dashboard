@@ -419,6 +419,7 @@ const BOOT_SCAN_FILES = [
   'app/tasks/native_tasks.js',
   'app/ydpc/ydpc_client.js',
   'app/ydpc/soho_client.js',
+  'app/ydpc/mqtt_client.js',
   'app/ydpc/cag_boot.js',
   'app/ydpc/zte_cag_raw.js',
   'app/ydpc/zte_cag_tls.js',
@@ -432,7 +433,6 @@ const BOOT_SCAN_FILES = [
 // app/ydpc 下与开机/保活链路无关、且各自有独立 TLS 口径的文件（豁免纳入扫描名单）
 const YDPC_SCAN_EXEMPT = new Set([
   'app/ydpc/cag_client.js',
-  'app/ydpc/mqtt_client.js',
   'app/ydpc/product_route.js',
 ]);
 
@@ -5731,6 +5731,144 @@ testAsync('P0-04：三平台编辑清空密码、空值不提交，新密码正�
     assert.strictEqual(calls.length, count, '新增账号空密码必须在请求前拒绝');
   }
   assert.strictEqual(toasts.filter(toast => toast.level === 'error').length, 3);
+});
+
+function makePhase1CagHarness(overrides = {}) {
+  const source = read('app/ydpc/cag_boot.js');
+  const sensitive = source.match(/^const SENSITIVE_KEYS = \[[\s\S]*?\];/m);
+  const certCodes = source.match(/^const CERT_CHAIN_ERROR_CODES = new Set\(\[[\s\S]*?\]\);/m);
+  assert.ok(sensitive && certCodes, '必须加载真实脱敏键和证书白名单');
+  const names = ['redactQueryString', 'redactForLog', 'describeErr', 'isCertChainError', 'makeWireLogger', 'cagHttpsRequest'];
+  const api = require('vm').runInNewContext([sensitive[0], certCodes[0],
+    'const _certChainWarned = new Set();', ...names.map(name => phase1FunctionFrom(source, name))].join('\n')
+    + `\n({ ${names.join(', ')} })`, { Buffer, DEFAULT_REQ_TIMEOUT: 15000,
+      https: { request() { throw new Error('测试不得访问外网'); } }, ...overrides });
+  return { api, source };
+}
+
+test('P0-05：对象/JSON 字符串/query/截断 JSON 均脱敏，wireLog 仅显式 true 开启', () => {
+  const { api, source } = makePhase1CagHarness();
+  const marker = 'FIXTURE_PRIVATE_VALUE';
+  for (const value of [
+    { password: marker, accessToken: marker, ZTE_Security_Params: marker, connectStr: marker,
+      nested: [{ vmPassword: marker }, { value: 'https://example.test/?token=' + marker }] },
+    JSON.stringify({ token: marker, nested: { secretKey: marker }, value: '?%70assword=' + marker }),
+    '/action?password=' + marker + '&AccessToken=' + marker + '&%74oken=' + marker,
+    '截断: {"password":"' + marker,
+  ]) assert.ok(!api.redactForLog(value).includes(marker), '任何支持的报文形式都不得保留凭据');
+  assert.ok(api.redactForLog({ status: 'pending' }).includes('pending'), '非敏感结构仍可诊断');
+  const wireLine = phase1FunctionFrom(source, 'cagBootVm').split('\n').find(line => /const wire =/.test(line));
+  assert.ok(wireLine);
+  let created = 0;
+  const factory = new Function('opts', 'makeWireLogger', 'onLog', `${wireLine}\nreturn wire;`);
+  for (const wireLog of [undefined, false, 'true']) {
+    assert.strictEqual(factory({ wireLog }, () => { created++; return () => {}; }, () => {}), null);
+  }
+  assert.strictEqual(created, 0, '默认不能创建报文日志回调');
+  assert.strictEqual(typeof factory({ wireLog: true }, () => { created++; return () => {}; }, () => {}), 'function');
+  assert.strictEqual(created, 1);
+});
+
+testAsync('P0-05：实际 CAG 请求/响应/超时日志脱敏，关闭 wire 后证书 warning 仍独立留证', async () => {
+  const { EventEmitter } = require('events');
+  const marker = 'FIXTURE_PRIVATE_VALUE';
+  const logs = [];
+  const warnings = [];
+  const attempts = [];
+  let mode = 'success';
+  const httpsMock = { request(options, callback) {
+    attempts.push(options);
+    const req = new EventEmitter();
+    req.write = () => {};
+    req.destroy = error => { if (error) queueMicrotask(() => req.emit('error', error)); };
+    req.end = () => queueMicrotask(() => {
+      if (mode === 'timeout') { req.emit('timeout'); return; }
+      if (mode === 'certificate' && options.rejectUnauthorized !== false) {
+        req.emit('error', Object.assign(new Error('fixture certificate'), { code: 'CERT_HAS_EXPIRED' }));
+        return;
+      }
+      const res = new EventEmitter();
+      res.statusCode = 200;
+      res.headers = {};
+      callback(res);
+      res.emit('data', Buffer.from(JSON.stringify({ accessToken: marker, nested: { connectStr: marker } })));
+      res.emit('end');
+    });
+    return req;
+  } };
+  const { api } = makePhase1CagHarness({ https: httpsMock });
+  const target = '/action?password=' + marker + '&accessToken=' + marker;
+  await api.cagHttpsRequest('p0-cag.example', 443, target, JSON.stringify({ ZTE_Security_Params: marker }), 50, message => logs.push(message));
+  mode = 'timeout';
+  await assert.rejects(api.cagHttpsRequest('p0-cag.example', 443, target, '', 50, message => logs.push(message)), /超时/);
+  assert.ok(logs.length > 0 && logs.every(message => !message.includes(marker)), '真实日志调用点不得泄漏凭据');
+  mode = 'certificate';
+  attempts.length = 0;
+  await api.cagHttpsRequest('p0-cert-cag.example', 443, target, '', 50, null,
+    { cookies: {}, securityLog: (message, level) => warnings.push({ message, level }) });
+  assert.strictEqual(attempts.length, 2);
+  assert.notStrictEqual(attempts[0].rejectUnauthorized, false);
+  assert.strictEqual(attempts[1].rejectUnauthorized, false);
+  assert.ok(warnings.length > 0 && warnings.every(entry => entry.level === 'warning'));
+  assert.ok(warnings.every(entry => !entry.message.includes(marker)), '安全通道只能留证，不能输出凭据');
+});
+
+testAsync('P0-05：MQTT 严格先行、IP 不发 SNI、显式开关和证书白名单才降级一次', async () => {
+  const { EventEmitter } = require('events');
+  const mqttSource = read('app/ydpc/mqtt_client.js');
+  const run = async (host, allowInsecure, failures) => {
+    const attempts = [];
+    const logs = [];
+    const tlsMock = { connect(options, callback) {
+      attempts.push(options);
+      const number = attempts.length - 1;
+      const socket = new EventEmitter();
+      socket.write = () => {};
+      socket.end = () => {};
+      socket.destroy = () => { socket.destroyed = true; setImmediate(() => socket.emit('close')); };
+      queueMicrotask(() => {
+        const code = failures[number];
+        if (code) socket.emit('error', Object.assign(new Error('fixture transport error'), { code }));
+        else { callback(); socket.emit('data', Buffer.from([0x20, 0x02, 0x00, 0x00])); }
+      });
+      return socket;
+    } };
+    const module = { exports: {} };
+    require('vm').runInNewContext(mqttSource, { module, Buffer, console, setTimeout, clearTimeout, setInterval, clearInterval,
+      require: name => name === 'tls' ? tlsMock : name === 'dns' ? {
+        lookup: (name, options, callback) => callback(null, [{ address: require('net').isIP(name) ? name : '203.0.113.1', family: 4 }]),
+      } : require(name),
+    });
+    const client = new module.exports.MqttKeepAliveClient({ host, allowInsecure, onLog: (label, message, level) => logs.push({ message, level }) });
+    let error = null;
+    try {
+      await client.connect(200);
+      await new Promise(setImmediate);
+      assert.strictEqual(client.isConnected, true, '旧尝试 close 不得破坏重试成功状态');
+    } catch (caught) { error = caught; }
+    finally { client.disconnect(); }
+    return { attempts, logs, error };
+  };
+  const strict = await run('198.51.100.1', undefined, ['CERT_HAS_EXPIRED']);
+  assert.ok(strict.error);
+  assert.strictEqual(strict.attempts.length, 1);
+  assert.strictEqual(Object.hasOwn(strict.attempts[0], 'servername'), false, 'IP Broker 不得作为 SNI');
+  assert.notStrictEqual(strict.attempts[0].rejectUnauthorized, false, '默认必须严格校验');
+  const retry = await run('broker.example', true, ['CERT_HAS_EXPIRED', null]);
+  assert.strictEqual(retry.error, null);
+  assert.strictEqual(retry.attempts.length, 2);
+  assert.notStrictEqual(retry.attempts[0].rejectUnauthorized, false);
+  assert.strictEqual(retry.attempts[1].rejectUnauthorized, false);
+  assert.strictEqual(retry.attempts[0].servername, 'broker.example');
+  assert.strictEqual(retry.logs.filter(entry => entry.level === 'warning').length, 1);
+  for (const code of ['ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND']) {
+    const failure = await run('broker.example', true, [code, null]);
+    assert.ok(failure.error, '非证书错误必须失败');
+    assert.strictEqual(failure.attempts.length, 1, '非证书错误不得降级');
+  }
+  const failedTwice = await run('broker.example', true, ['CERT_HAS_EXPIRED', 'CERT_HAS_EXPIRED']);
+  assert.ok(failedTwice.error);
+  assert.strictEqual(failedTwice.attempts.length, 2, '最多只降级一次');
 });
 
 // ============================================================================

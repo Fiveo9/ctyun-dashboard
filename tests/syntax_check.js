@@ -18,6 +18,7 @@ const FILES = [
   'app/tasks/native_tasks.js',
   'app/tasks/scheduler.js',
   'app/ydpc/ydpc_client.js',
+  'app/ydpc/mqtt_client.js',
   'app/ydpc/product_route.js',
   'app/ydpc/cag_boot.js',
   'app/ydpc/zte_cag_raw.js',
@@ -35,6 +36,7 @@ let failed = 0;
 // 教训：变异验证曾因清单漂移而退化成假 PASS（见 tests/mutation_check.js 的 2026-09-23 修复）。
 const REQUIRED = [
   'server.js',
+  'app/ydpc/mqtt_client.js',
   'app/ydpc/product_route.js',
   'app/ydpc/zte_cag_tls.js',
   'app/ydpc/scg_keepalive.js',

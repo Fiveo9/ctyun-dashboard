@@ -52,7 +52,7 @@
 | `P0-02` | P0 | `server.js` | 修复 SSRF 过滤绕过（IPv6 方括号/DNS 重绑定/302 跳转） | `server.js` | [x] |
 | `P0-03` | P0 | `app/static`, `server.js` | 消除存储型 XSS、属性注入与服务端 HTML/Script 注入 | `app/static/app.js`, `server.js` | [x] |
 | `P0-04` | P0 | `server.js`, `app/static` | API 响应剥离明文密码与会话密钥，编辑弹窗不再回填明文密码 | `server.js`, `app/static/app.js` | [x] |
-| `P0-05` | P0 | `app/ydpc` | 关闭 `cag_boot.js` 默认 wireLog 凭据泄露；恢复 `mqtt_client.js` TLS 校验 | `app/ydpc/cag_boot.js`, `app/ydpc/mqtt_client.js` | [ ] |
+| `P0-05` | P0 | `app/ydpc` | 关闭 `cag_boot.js` 默认 wireLog 凭据泄露；恢复 `mqtt_client.js` TLS 校验 | `app/ydpc/cag_boot.js`, `app/ydpc/mqtt_client.js` | [x] |
 | `P0-06` | P0 | `app/static` | 移除第三方二维码外链，本地生成扫码登录二维码 | `app/static/app.js`, `server.js` | [ ] |
 | `P0-07` | P0 | `auth_manager.js`, `sidecar.py`, 全局 | `scrypt` 密码哈希升级、改密吊销会话、`0600` 落盘与安全随机数 | `app/auth_manager.js`, `app/ecloud_engine/sidecar.py`, `native_tasks.js`, `soho_client.js`, `server.js` | [ ] |
 | `P1-01` | P1 | `server.js` | 修复飞书通知未用剥离后 URL 与管理员测推送漏传 `secret` | `server.js` | [ ] |
@@ -207,6 +207,7 @@
      - ⚠️ 遵守回归组 7 红线：严禁在 `app/ydpc/` 出现无条件 `rejectUnauthorized: false` 字面量！
      - 参照 `cag_boot.js` / `scg_keepalive.js` 模式：构造 `tlsOptions` 时当 `net.isIP(this.host) === 0` 才设置 `servername: this.host`；默认走严格证书校验（不设置 `rejectUnauthorized`）；若连接抛出证书链白名单错误（`CERT_HAS_EXPIRED`、`DEPTH_ZERO_SELF_SIGNED_CERT`、`SELF_SIGNED_CERT_IN_CHAIN`、`UNABLE_TO_VERIFY_LEAF_SIGNATURE`、`ERR_TLS_CERT_ALTNAME_INVALID` 等），记录一条包含 host 与错误码的 `warning` 日志后，通过显式 `allowInsecure` 参数重试一次（仅在 `if (allowInsecure) options.rejectUnauthorized = false;` 分支设置）；非证书链错误直接失败，不降级。
 - **验收**：运行 `npm test` 组 7 扫描通过；触发移动爱家开机时日志中不再出现明文或静态可逆 `password=` / `accessToken=`；MQTT 连接 IP Broker 不再触发 `DEP0123`。
+- **执行记录（2026-11-24）**：wireLog 默认关闭，对对象/JSON 字符串/query/截断 JSON 脱敏，安全 warning 保留独立通道。MQTT 默认严格 TLS，IP 不设置 SNI，构造参数 allowInsecure 必须显式为 true 且命中证书错误白名单才重试一次；旧连接事件不影响重试连接。MQTT 纳入红线与语法扫描。新增 3 项回归、4 项变异；221 通过、0 失败，15 个文件语法通过，已做只读 review；真实 Broker/开机日志尚未实测。
 
 ---
 

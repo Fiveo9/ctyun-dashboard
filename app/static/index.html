@@ -792,6 +792,11 @@
           <label id="user-notify-token-label">Webhook URL</label>
           <input type="text" class="form-control" id="user-notify-token" placeholder="请输入对应 Key 或 URL">
         </div>
+        <div class="form-group hidden" id="group-user-notify-tg-api-base">
+          <label for="user-notify-tg-api-base">TG_API_BASE (选填)</label>
+          <input type="url" class="form-control" id="user-notify-tg-api-base" placeholder="https://api.telegram.org">
+          <div class="form-text">可填写可信的 Telegram API 代理地址（支持路径前缀）；留空使用环境变量 TG_API_BASE，未设置则使用官方地址 https://api.telegram.org。</div>
+        </div>
         <div class="form-group hidden" id="group-user-notify-secret">
           <label id="user-notify-secret-label">加签密钥 (Secret / 选填)</label>
           <input type="text" class="form-control" id="user-notify-secret" placeholder="例如钉钉 SEC... 或飞书签名密钥 (如未开启加签请留空)">

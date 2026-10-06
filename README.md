@@ -126,6 +126,20 @@ services:
 docker compose up -d
 ```
 
+#### 📬 Telegram 自定义 API 地址
+
+在个人通知设置中选择「Telegram 机器人」，可通过选填的 `TG_API_BASE` 设置 Telegram Bot API 代理地址，例如 `https://tg-api.example.com` 或 `https://tg-api.example.com/telegram/`。保存配置和「立即测试推送」都会使用该地址。
+
+地址优先级：**个人通知设置的 `TG_API_BASE` > 环境变量 `TG_API_BASE` > `https://api.telegram.org`**。留空使用默认值；个人设置保存后即时生效，修改环境变量后需重启服务。
+
+Docker CLI 可增加 `-e TG_API_BASE=https://tg-api.example.com`；Docker Compose 可在 `environment` 中增加：
+
+```yaml
+- TG_API_BASE=https://tg-api.example.com
+```
+
+只填写基础地址（可带路径前缀），系统会自动去掉末尾斜杠并追加 `/bot<BotToken>/sendMessage`。基础地址不能包含查询参数或片段，且须为公共 HTTP/HTTPS 地址；请求继续执行内网地址与 DNS 校验。
+
 #### 3. 📡 移动公众（公众版）：开箱即用，可选覆盖
 
 移动公众的签名常量（AccessKey / SecretKey / RSA 密钥对）是**官方公众线客户端内置的固定材料**（公开信息），镜像与仓库已内置（`app/ecloud_engine/public_credentials.json`），**默认无需任何额外配置即可添加与保活移动公众账号**。加载优先级：

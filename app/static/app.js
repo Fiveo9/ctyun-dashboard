@@ -4376,6 +4376,9 @@ async function openUserNotifyModal() {
     if (document.getElementById("user-notify-token")) {
       document.getElementById("user-notify-token").value = notify.webhookUrl || "";
     }
+    if (document.getElementById("user-notify-tg-api-base")) {
+      document.getElementById("user-notify-tg-api-base").value = notify.tgApiBase || "";
+    }
     if (document.getElementById("user-notify-secret")) {
       document.getElementById("user-notify-secret").value = notify.secret || "";
     }
@@ -4396,6 +4399,7 @@ function onUserNotifyChannelChange(isUserSwitch = true) {
   const channelEl = document.getElementById("user-notify-channel");
   const label = document.getElementById("user-notify-token-label");
   const input = document.getElementById("user-notify-token");
+  const tgApiBaseGroup = document.getElementById("group-user-notify-tg-api-base");
   const secretGroup = document.getElementById("group-user-notify-secret");
   const secretInput = document.getElementById("user-notify-secret");
   const secretHint = document.getElementById("user-notify-secret-hint");
@@ -4403,6 +4407,11 @@ function onUserNotifyChannelChange(isUserSwitch = true) {
 
   const channel = channelEl.value;
   const currentVal = input.value.trim();
+
+  if (tgApiBaseGroup) {
+    if (channel === "telegram") tgApiBaseGroup.classList.remove("hidden");
+    else tgApiBaseGroup.classList.add("hidden");
+  }
 
   // 控制加签密钥输入框的显隐
   if (secretGroup) {
@@ -4468,6 +4477,7 @@ function onUserNotifyChannelChange(isUserSwitch = true) {
 async function testUserNotify() {
   const channel = document.getElementById("user-notify-channel") ? document.getElementById("user-notify-channel").value : "webhook";
   const webhookUrl = document.getElementById("user-notify-token") ? document.getElementById("user-notify-token").value.trim() : "";
+  const tgApiBase = document.getElementById("user-notify-tg-api-base") ? document.getElementById("user-notify-tg-api-base").value.trim() : "";
   const secret = document.getElementById("user-notify-secret") ? document.getElementById("user-notify-secret").value.trim() : "";
   const customTitleTemplate = document.getElementById("user-notify-title-tpl") ? document.getElementById("user-notify-title-tpl").value.trim() : "";
   const customContentTemplate = document.getElementById("user-notify-content-tpl") ? document.getElementById("user-notify-content-tpl").value.trim() : "";
@@ -4482,7 +4492,7 @@ async function testUserNotify() {
     const res = await authFetch("/api/user/notify/test", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ channel, webhookUrl, secret, customTitleTemplate, customContentTemplate })
+      body: JSON.stringify({ channel, webhookUrl, tgApiBase, secret, customTitleTemplate, customContentTemplate })
     });
     const data = await res.json();
     if (res.ok && data.success) {
@@ -4500,6 +4510,7 @@ async function saveUserNotify() {
     enabled: document.getElementById("user-notify-enabled") ? document.getElementById("user-notify-enabled").checked : false,
     channel: document.getElementById("user-notify-channel") ? document.getElementById("user-notify-channel").value : "webhook",
     webhookUrl: document.getElementById("user-notify-token") ? document.getElementById("user-notify-token").value.trim() : "",
+    tgApiBase: document.getElementById("user-notify-tg-api-base") ? document.getElementById("user-notify-tg-api-base").value.trim() : "",
     secret: document.getElementById("user-notify-secret") ? document.getElementById("user-notify-secret").value.trim() : "",
     customTitleTemplate: document.getElementById("user-notify-title-tpl") ? document.getElementById("user-notify-title-tpl").value.trim() : "",
     customContentTemplate: document.getElementById("user-notify-content-tpl") ? document.getElementById("user-notify-content-tpl").value.trim() : ""

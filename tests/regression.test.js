@@ -5292,6 +5292,7 @@ function makePhase1RouteHarness(session = null, overrides = {}) {
     proxyStaticAsset: () => { throw new Error('匿名请求不得回源'); },
     appendLog: () => {}, clientInstances: new Map(), initAllKeepAlive: () => {},
     setTimeout: () => 0, appConfig: { accounts: [], settings: {} },
+    isValidTelegramApiBase: rawBase => makePhase1PublicUrlHarness().isValidTelegramApiBase(rawBase),
     ...overrides,
   };
   const handler = vm.runInNewContext(server.slice(start, end).replace('const server =', 'globalThis.handler ='), context);
@@ -5401,10 +5402,11 @@ function phase1ServerFunction(name) {
 function makePhase1PublicUrlHarness(overrides = {}) {
   const vm = require('vm');
   const names = ['isPrivateIpOrHost', 'splitWebhookSecret', 'isValidWebhookTarget',
-    'assertSafePublicUrl', 'requestPinnedPublicUrl', 'fetchSafeNotification', 'sendNotification'];
+    'isValidTelegramApiBase', 'assertSafePublicUrl', 'requestPinnedPublicUrl', 'fetchSafeNotification', 'sendNotification'];
   const source = names.map(phase1ServerFunction).join('\n') + `\n({ ${names.join(', ')} })`;
   return vm.runInNewContext(source, { URL, URLSearchParams, Buffer, setTimeout, clearTimeout,
     net: require('net'), crypto: require('crypto'),
+    process: { env: {} },
     dns: { promises: { lookup: async () => [{ address: '8.8.8.8', family: 4 }] } },
     http: { request: () => { throw new Error('测试不得访问外网'); } },
     https: { request: () => { throw new Error('测试不得访问外网'); } },
@@ -7407,6 +7409,171 @@ testAsync('P1-06：单机关机仅关闭该机守护，全机关/已关机才暂
     await sample.request('/api/accounts/state/power/shutdown?desktopId=1', 'POST').run();
     assert.strictEqual(account.features.keepAlive, !state.useStatusText, '只有明确关机证据才可判全关，不能把未知枚举当已关机');
   }
+});
+
+// ============================================================================
+// TG_API_BASE · Telegram 自定义 API 基础地址
+// ============================================================================
+group('TG_API_BASE · Telegram 自定义 API 基础地址');
+
+function makeTelegramRouteHarness(body, savedNotify = {}, role = 'admin') {
+  const sent = [], stored = { notify: null, writes: 0 };
+  const targets = makePhase1PublicUrlHarness();
+  const route = makePhase1RouteHarness({ userId: 'tg-fixture', username: 'fixture', role }, {
+    appConfig: { accounts: [], settings: { notify: savedNotify } }, taskScheduler: null,
+    parseJsonBody: async () => body, saveConfig() {},
+    isValidWebhookTarget: targets.isValidWebhookTarget,
+    authManager: {
+      updateUserNotify(userId, notify) { stored.notify = { ...notify }; stored.writes++; return true; },
+      getUserNotify: () => stored.notify,
+    },
+    sendNotification: async settings => { sent.push(settings.notify); return { success: true }; },
+  });
+  return { ...route, sent, stored };
+}
+
+testAsync('TG_API_BASE：默认、环境变量、个人覆盖、空白与路径前缀正确拼接', async () => {
+  for (const [tgApiBase, environmentBase, expectedBase] of [
+    [undefined, undefined, 'https://api.telegram.org'],
+    ['', 'https://tg-api.example.com', 'https://tg-api.example.com'],
+    ['   ', ' https://tg-api.example.com/// ', 'https://tg-api.example.com'],
+    [undefined, '   ', 'https://api.telegram.org'],
+    [' https://personal.example.com/telegram/// ', 'https://global.example.com', 'https://personal.example.com/telegram'],
+    ['https://personal.example.com', 'http://127.0.0.1', 'https://personal.example.com'],
+    [undefined, 'http://tg-api.example.com:8080/telegram/', 'http://tg-api.example.com:8080/telegram'],
+  ]) {
+    const calls = [];
+    const api = makePhase1PublicUrlHarness({ process: { env: { TG_API_BASE: environmentBase } },
+      fetchWithTimeout: async (url, options, timeout) => { calls.push({ url, options, timeout }); return { ok: true, status: 200 }; },
+    });
+    const result = await api.sendNotification({ notify: { enabled: true, channel: 'telegram',
+      webhookUrl: '123456:TEST_BOT_VALUE@-12345', tgApiBase } }, '标题', '内容');
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].url, `${expectedBase}/bot123456:TEST_BOT_VALUE/sendMessage`);
+    assert.strictEqual(calls[0].options.safePublicTarget.url, calls[0].url);
+    assert.strictEqual(calls[0].options.redirect, 'error');
+    assert.strictEqual(calls[0].timeout, 15000);
+    assert.deepStrictEqual(JSON.parse(calls[0].options.body), { chat_id: '-12345', text: '*标题*\n\n内容', parse_mode: 'Markdown' });
+  }
+});
+
+testAsync('TG_API_BASE：非法基础地址及 DNS 私网在发送前拒绝', async () => {
+  let calls = 0;
+  const api = makePhase1PublicUrlHarness({ fetchWithTimeout: async () => { calls++; return { ok: true }; } });
+  const notify = { enabled: true, channel: 'telegram', webhookUrl: '123456:TEST_BOT_VALUE@12345' };
+  for (const tgApiBase of ['http://127.0.0.1:8080', 'http://[::1]', 'http://localhost',
+    'ftp://tg-api.example.com', 'tg-api.example.com', 'https://fixture-user@tg-api.example.com',
+    'https://tg-api.example.com?x=1', 'https://tg-api.example.com?', 'https://tg-api.example.com#fragment',
+    'https://tg-api.example.com#', 123, {}]) {
+    assert.strictEqual(api.isValidTelegramApiBase(tgApiBase), false);
+    const result = await api.sendNotification({ notify: { ...notify, tgApiBase } }, '标题', '内容');
+    assert.strictEqual(result.success, false);
+  }
+  const privateDns = makePhase1PublicUrlHarness({
+    dns: { promises: { lookup: async () => [{ address: '127.0.0.1', family: 4 }] } },
+    fetchWithTimeout: async () => { calls++; return { ok: true }; },
+  });
+  assert.strictEqual((await privateDns.sendNotification({ notify: { ...notify, tgApiBase: 'https://tg-api.example.com' } }, '标题', '内容')).success, false);
+  const privateEnvironment = makePhase1PublicUrlHarness({ process: { env: { TG_API_BASE: 'http://127.0.0.1' } },
+    fetchWithTimeout: async () => { calls++; return { ok: true }; },
+  });
+  assert.strictEqual((await privateEnvironment.sendNotification({ notify }, '标题', '内容')).success, false);
+  assert.strictEqual(calls, 0);
+});
+
+test('TG_API_BASE：个人配置可保存、回读、清空且不影响其他用户', () => {
+  const { AuthManager } = require(path.join(ROOT, 'app/auth_manager.js'));
+  const auth = Object.create(AuthManager.prototype);
+  const other = { id: 'other', notify: { tgApiBase: 'https://other.example.com' } };
+  let writes = 0;
+  auth.configManager = { config: { users: [{ id: 'tg-fixture' }, other] }, saveConfig() { writes++; } };
+  const notify = { enabled: true, channel: 'telegram', webhookUrl: '123456:TEST_BOT_VALUE@12345', tgApiBase: ' https://tg-api.example.com/telegram/ ' };
+  assert.strictEqual(auth.updateUserNotify('tg-fixture', notify), true);
+  assert.strictEqual(auth.getUserNotify('tg-fixture').tgApiBase, 'https://tg-api.example.com/telegram/');
+  assert.strictEqual(auth.updateUserNotify('tg-fixture', { ...notify, tgApiBase: '' }), true);
+  assert.strictEqual(auth.getUserNotify('tg-fixture').tgApiBase, '');
+  assert.strictEqual(auth.getUserNotify('other').tgApiBase, 'https://other.example.com');
+  assert.strictEqual(writes, 2);
+});
+
+testAsync('TG_API_BASE：个人与管理员即时测试透传地址，支持继承和显式清空', async () => {
+  const savedNotify = { channel: 'telegram', webhookUrl: '123456:TEST_BOT_VALUE@12345', tgApiBase: 'https://saved.example.com' };
+  for (const [url, body, expected] of [
+    ['/api/user/notify/test', { ...savedNotify, tgApiBase: 'https://personal.example.com' }, 'https://personal.example.com'],
+    ['/api/notify/test', { tgApiBase: 'https://custom.example.com' }, 'https://custom.example.com'],
+    ['/api/notify/test', {}, 'https://saved.example.com'],
+    ['/api/notify/test', { tgApiBase: '' }, ''],
+  ]) {
+    const h = makeTelegramRouteHarness(body, savedNotify, url.startsWith('/api/user/') ? 'user' : 'admin');
+    const request = h.request(url, 'POST');
+    await request.run();
+    assert.strictEqual(request.res.statusCode, 200);
+    assert.strictEqual(h.sent.length, 1);
+    assert.strictEqual(h.sent[0].tgApiBase, expected);
+  }
+});
+
+testAsync('TG_API_BASE：个人与全局保存接口持久传递地址，管理员通知同步', async () => {
+  const notify = { enabled: true, channel: 'telegram', webhookUrl: '123456:TEST_BOT_VALUE@12345', tgApiBase: 'https://tg-api.example.com' };
+  for (const url of ['/api/user/notify', '/api/settings']) {
+    const h = makeTelegramRouteHarness(url === '/api/settings' ? { notify } : notify);
+    const request = h.request(url, 'PUT');
+    await request.run();
+    assert.strictEqual(request.res.statusCode, 200);
+    assert.strictEqual(h.context.appConfig.settings.notify.tgApiBase, notify.tgApiBase);
+    const readback = h.request(url, 'GET');
+    await readback.run();
+    assert.strictEqual(JSON.parse(readback.res.body).tgApiBase || JSON.parse(readback.res.body).notify.tgApiBase, notify.tgApiBase);
+  }
+});
+
+testAsync('TG_API_BASE：非法自定义地址在保存和测试接口返回 400', async () => {
+  for (const [url, method] of [['/api/user/notify', 'PUT'], ['/api/settings', 'PUT'],
+    ['/api/user/notify/test', 'POST'], ['/api/notify/test', 'POST']]) {
+    const notify = { enabled: true, channel: 'telegram', webhookUrl: '123456:TEST_BOT_VALUE@12345', tgApiBase: 'http://127.0.0.1' };
+    const h = makeTelegramRouteHarness(url === '/api/settings' ? { notify } : notify);
+    const request = h.request(url, method);
+    await request.run();
+    assert.strictEqual(request.res.statusCode, 400);
+    assert.strictEqual(h.sent.length, 0);
+    assert.strictEqual(h.stored.writes, 0);
+    assert.strictEqual(h.context.appConfig.settings.notify.tgApiBase, undefined);
+  }
+});
+
+testAsync('TG_API_BASE：表单回填、渠道显隐及保存和测试使用当前输入', async () => {
+  const ids = ['user-notify-enabled', 'user-notify-channel', 'user-notify-token', 'user-notify-token-label',
+    'user-notify-tg-api-base', 'group-user-notify-tg-api-base', 'user-notify-secret',
+    'user-notify-title-tpl', 'user-notify-content-tpl'];
+  const elements = Object.fromEntries(ids.map(id => [id, { value: '', checked: false }]));
+  let hidden = true, storedNotify = { channel: 'telegram', tgApiBase: 'https://saved.example.com', webhookUrl: '123456:TEST_BOT_VALUE@12345' };
+  const requests = [];
+  elements['group-user-notify-tg-api-base'].classList = { add() { hidden = true; }, remove() { hidden = false; } };
+  const names = ['openUserNotifyModal', 'onUserNotifyChannelChange', 'testUserNotify', 'saveUserNotify'];
+  const api = require('vm').runInNewContext(names.map(name => phase1FunctionFrom(phase1AppSource, name)).join('\n')
+    + `\n({ ${names.join(', ')} })`, { document: { getElementById: id => elements[id] || null },
+      authFetch: async (url, options) => {
+        if (!options) return { ok: true, json: async () => storedNotify };
+        requests.push({ url, body: JSON.parse(options.body) });
+        return { ok: true, json: async () => ({ success: true }) };
+      }, showToast() {}, openModal() {}, closeModal() {},
+    });
+  assert.ok(read('app/static/index.html').includes('id="user-notify-tg-api-base"'));
+  await api.openUserNotifyModal();
+  assert.strictEqual(elements['user-notify-tg-api-base'].value, storedNotify.tgApiBase);
+  assert.strictEqual(hidden, false);
+  elements['user-notify-channel'].value = 'webhook'; api.onUserNotifyChannelChange(false);
+  assert.strictEqual(hidden, true);
+  assert.strictEqual(elements['user-notify-tg-api-base'].value, storedNotify.tgApiBase);
+  elements['user-notify-channel'].value = 'telegram'; api.onUserNotifyChannelChange(false);
+  assert.strictEqual(hidden, false);
+  elements['user-notify-tg-api-base'].value = ' https://custom.example.com/telegram/ ';
+  await api.testUserNotify(); await api.saveUserNotify();
+  assert.deepStrictEqual(requests.map(item => item.url), ['/api/user/notify/test', '/api/user/notify']);
+  assert.ok(requests.every(item => item.body.tgApiBase === 'https://custom.example.com/telegram/'));
+  storedNotify = { channel: 'telegram' }; await api.openUserNotifyModal();
+  assert.strictEqual(elements['user-notify-tg-api-base'].value, '', '旧配置未带新字段时必须清空上次回填值');
 });
 
 // ============================================================================

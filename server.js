@@ -598,6 +598,13 @@ function isValidWebhookUrl(rawUrl) {
   return isValidWebhookTarget('webhook', rawUrl);
 }
 
+function isValidTelegramApiBase(rawBase) {
+  if (rawBase == null) return true;
+  if (typeof rawBase !== 'string') return false;
+  const base = rawBase.trim();
+  return !base || (!/[?#]/.test(base) && isValidWebhookTarget('webhook', base));
+}
+
 async function assertSafePublicUrl(rawUrl) {
   const u = new URL(rawUrl);
   if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password || isPrivateIpOrHost(u.hostname)) {
@@ -896,7 +903,13 @@ async function sendNotification(settings, title, content, extraVars = {}) {
     } else if (channel === 'telegram' && notify.webhookUrl) {
       const [botToken, chatId] = notify.webhookUrl.split('@');
       if (botToken && chatId) {
-        const res = await fetchSafeNotification(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        const tgApiBase = (String(notify.tgApiBase || '').trim()
+          || String(process.env.TG_API_BASE || '').trim()
+          || 'https://api.telegram.org').replace(/\/+$/, '');
+        if (!isValidTelegramApiBase(tgApiBase)) {
+          return { success: false, message: 'TG_API_BASE 必须是公共 HTTP/HTTPS 基础地址，且不能包含查询参数或片段' };
+        }
+        const res = await fetchSafeNotification(`${tgApiBase}/bot${botToken}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ chat_id: chatId, text: `*${finalTitle}*\n\n${finalContent}`, parse_mode: 'Markdown' })
@@ -1056,7 +1069,8 @@ function getDefaultConfig() {
       notify: {
         enabled: false,
         channel: 'webhook',
-        webhookUrl: ''
+        webhookUrl: '',
+        tgApiBase: ''
       },
       systemTitle: '天翼云/移动云电脑保活签到中心',
       systemSubtitle: '多账号长连接保活守护 · 多运营商支持 · 每日签到打卡 · 智能挂机'
@@ -6562,6 +6576,10 @@ function rewardNeedsDesktop(prodId, prodType) {
         return;
       }
     }
+    if (body.notify?.channel === 'telegram' && !isValidTelegramApiBase(body.notify.tgApiBase)) {
+      jsonResponse(res, { error: 'TG_API_BASE 必须是公共 HTTP/HTTPS 基础地址，且不能包含查询参数或片段' }, 400);
+      return;
+    }
 
     appConfig.settings = { ...appConfig.settings, ...body };
     saveConfig(appConfig);
@@ -6609,6 +6627,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       enabled: false,
       channel: 'webhook',
       webhookUrl: '',
+      tgApiBase: '',
       customTitleTemplate: '',
       customContentTemplate: ''
     };
@@ -6627,6 +6646,10 @@ function rewardNeedsDesktop(prodId, prodType) {
     const webhookUrl = String(body.webhookUrl || '').trim();
     if (body.enabled && webhookUrl && !isValidWebhookTarget(channel, webhookUrl)) {
       jsonResponse(res, { error: '安全拦截：禁止设置内网/私有IP或目标格式非法！' }, 400);
+      return;
+    }
+    if (channel === 'telegram' && !isValidTelegramApiBase(body.tgApiBase)) {
+      jsonResponse(res, { error: 'TG_API_BASE 必须是公共 HTTP/HTTPS 基础地址，且不能包含查询参数或片段' }, 400);
       return;
     }
     const ok = authManager.updateUserNotify(session.userId, body);
@@ -6657,11 +6680,16 @@ function rewardNeedsDesktop(prodId, prodType) {
       jsonResponse(res, { success: false, message: '安全拦截：目标地址为内网/私有IP或格式非法，已被系统拒绝！' }, 400);
       return;
     }
+    if (channel === 'telegram' && !isValidTelegramApiBase(body.tgApiBase)) {
+      jsonResponse(res, { success: false, message: 'TG_API_BASE 必须是公共 HTTP/HTTPS 基础地址，且不能包含查询参数或片段' }, 400);
+      return;
+    }
     const testSettings = {
       notify: {
         enabled: true,
         channel: channel,
         webhookUrl: testUrl,
+        tgApiBase: body.tgApiBase ?? '',
         secret: body.secret || '',
         customTitleTemplate: body.customTitleTemplate || '',
         customContentTemplate: body.customContentTemplate || ''
@@ -6692,8 +6720,13 @@ function rewardNeedsDesktop(prodId, prodType) {
     const body = await parseJsonBody(req);
     const channel = body.channel || appConfig.settings?.notify?.channel || 'webhook';
     const testUrl = (body.webhookUrl || appConfig.settings?.notify?.webhookUrl || '').trim();
+    const tgApiBase = body.tgApiBase ?? appConfig.settings?.notify?.tgApiBase ?? '';
     if (!isValidWebhookTarget(channel, testUrl)) {
       jsonResponse(res, { success: false, message: '安全拦截：目标地址为内网/本地私有地址或格式非法，已被系统拒绝！' }, 400);
+      return;
+    }
+    if (channel === 'telegram' && !isValidTelegramApiBase(tgApiBase)) {
+      jsonResponse(res, { success: false, message: 'TG_API_BASE 必须是公共 HTTP/HTTPS 基础地址，且不能包含查询参数或片段' }, 400);
       return;
     }
 
@@ -6702,6 +6735,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         enabled: true,
         channel: body.channel || appConfig.settings?.notify?.channel,
         webhookUrl: testUrl,
+        tgApiBase,
         secret: body.secret ?? appConfig.settings?.notify?.secret ?? '',
         customTitleTemplate: body.customTitleTemplate || appConfig.settings?.notify?.customTitleTemplate,
         customContentTemplate: body.customContentTemplate || appConfig.settings?.notify?.customContentTemplate

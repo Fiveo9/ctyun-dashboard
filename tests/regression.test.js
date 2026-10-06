@@ -5655,6 +5655,8 @@ test('P0-04：账号脱敏保留业务字段与 hasPassword，原配置保持完
 
 testAsync('P0-04：三平台列表与更新实际响应不含凭据，空密码更新保留服务器原值', async () => {
   const sanitize = new Function(`${phase1ServerFunction('sanitizeAccountForClient')}\nreturn sanitizeAccountForClient;`)();
+  const resolve = new Function('TASK_CN_NAME', 'TASK_FEATURE_KEY', 'ECLOUD_KEEPALIVE_TASKS',
+    `${phase1ServerFunction('resolveTaskEnabled')}\nreturn resolveTaskEnabled;`)({}, {}, new Set(['keepAlive']));
   const accounts = ['ctyun', 'ydpc', 'ecloud'].map((platform, index) => ({ id: 'account-' + index, platform,
     password: 'fixture-' + index, savedLoginInfo: { internal: true }, _smsCodeKey: 'fixture-sms',
     features: { keepAlive: false }, enabled: false, name: '原备注', desktops: [], vms: [],
@@ -5664,7 +5666,7 @@ testAsync('P0-04：三平台列表与更新实际响应不含凭据，空密码�
   }]));
   let body = {};
   const harness = makePhase1RouteHarness({ role: 'admin' }, { appConfig: { accounts, settings: {} },
-    getClient: account => clients.get(account.id), sanitizeAccountForClient: sanitize,
+    getClient: account => clients.get(account.id), sanitizeAccountForClient: sanitize, resolveTaskEnabled: resolve,
     parseJsonBody: async () => body, canUserAccessAccount: () => true, saveConfig: () => {},
   });
   const list = harness.request('/api/accounts');
@@ -6287,7 +6289,7 @@ group('Phase 2 · 主服务与调度器修复');
 
 function phase2CtYunMethods(anchors, globals = {}) {
   const vm = require('vm');
-  const source = anchors.map(anchor => extractMethodFrom(server, anchor)).join(',\n');
+  const source = anchors.map(anchor => extractMethodFrom(server, '\n  ' + anchor)).join(',\n');
   return vm.runInNewContext(`({\n${source}\n})`, {
     Buffer, URL, console, Date,
     appConfig: {}, appendLog() {},
@@ -6930,6 +6932,21 @@ testAsync('P1-05：仅自动兑换未完成也需启动补跑，已完成或独�
   }
 });
 
+testAsync('P1-05：混合平台启动补跑只考核天翼云，已完成时不探测移动官方任务或重复补跑', async () => {
+  const accounts = [phase2SchedulerAccount('startup-ct'), phase2SchedulerAccount('startup-ec', 'ecloud'), phase2SchedulerAccount('startup-yd', 'ydpc')];
+  const h = phase2SchedulerHarness({ accounts, cron: { executeTime: '01:20' } });
+  let mobileReads = 0;
+  for (const id of ['startup-ec', 'startup-yd']) {
+    h.clients.get(id).refreshOfficialTasks = async () => { mobileReads++; return { ok: false }; };
+  }
+  const caught = [];
+  h.instance.runAllAccounts = async (...args) => caught.push(args);
+  await h.instance.checkStartupCatchup();
+  assert.strictEqual(mobileReads, 0, '启动补跑不能探测移动平台的天翼云官方任务');
+  assert.strictEqual(h.instance.lastCompletedDate, '2026-11-24', '天翼云已完成时不能被移动平台空任务阻断');
+  assert.strictEqual(caught.length, 0, '混合平台不能导致已完成的天翼云再次补跑');
+});
+
 testAsync('P1-05：准点与巡检任意先后同分钟只触发一次，独立 Cron 和未管辖分项均不丢失', async () => {
   for (const active of [false, true]) for (const pointFirst of [false, true]) {
     const acc = phase2SchedulerAccount('minute', 'ctyun', { autoRedeem: true });
@@ -6971,6 +6988,425 @@ testAsync('P1-05：native 挂机对两个移动平台早退，天翼云仍调用
     assert.strictEqual(result.isCompleted, platform !== 'ctyun');
   }
   assert.strictEqual((native.match(/isCompleted:\s*true/g) || []).length, 3, 'native 的三处完成返回字面量必须保持');
+});
+
+function phase2ServiceHarness({ accounts = [], settings = {}, body = {}, session = { role: 'admin', userId: 'fixture-admin', username: 'fixture-admin' }, authUser, overrides = {} } = {}) {
+  const config = { accounts, settings }, clients = new Map(), events = [], warnings = [];
+  let saves = 0, schedules = 0, parses = 0, nextId = 0;
+  const resolve = new Function('TASK_CN_NAME', 'TASK_FEATURE_KEY', 'ECLOUD_KEEPALIVE_TASKS',
+    `${phase1ServerFunction('resolveTaskEnabled')}\nreturn resolveTaskEnabled;`)({}, {}, new Set(['keepAlive']));
+  const getClient = acc => {
+    if (clients.has(acc.id)) return clients.get(acc.id);
+    const client = { account: acc, metrics: { status: 'offline', keepAliveSeconds: 60, cycleCountdown: 60, officialTasks: [], userPoints: 100 },
+      workerRunning: false, wsAlive: false, startCalls: 0, stopKeepAliveCalls: 0,
+      desktopsCache: acc.desktops || [],
+      startKeepAliveWorker() { this.startCalls++; this.workerRunning = true; events.push(['start', acc.id]); },
+      stopKeepAliveWorker() { this.stopKeepAliveCalls++; this.workerRunning = false; this.wsAlive = false; events.push(['worker-stop', acc.id]); },
+      refreshDesktops: async () => { events.push(['refresh', acc.id]); return acc.desktops || []; },
+      refreshVms: async () => { events.push(['refresh-vms', acc.id]); return []; },
+      getDesktops: async () => acc.desktops || [], getRewards: async () => [{ prodId: 55 }],
+      controlPower: async () => ({ success: true }), yieldToWebUser() {}, resumeFromWebUser() {},
+    };
+    clients.set(acc.id, client);
+    return client;
+  };
+  for (const acc of accounts) getClient(acc);
+  const safeTargets = makePhase1PublicUrlHarness();
+  class FakeCtYunClient { static extractDesktopSpecs() { return {}; } }
+  const route = makePhase1RouteHarness(session, {
+    appConfig: config, clientInstances: clients, getClient, resolveTaskEnabled: resolve,
+    sanitizeAccountForClient: new Function(`${phase1ServerFunction('sanitizeAccountForClient')}\nreturn sanitizeAccountForClient;`)(),
+    canUserAccessAccount: (s, acc) => s.role === 'admin' || s.userId === acc.ownerId,
+    parseJsonBody: async () => { parses++; return body; }, saveConfig: () => { saves++; },
+    authManager: { getUserById: () => authUser || { role: session?.role || 'user', maxQuota: 5 } },
+    crypto: { randomUUID: () => String(++nextId).padStart(8, '0') + '-0000-0000-0000-000000000000' },
+    generateDeviceCode: () => 'fixture-device', CtYunClient: FakeCtYunClient,
+    ECLOUD_LOG_SOURCE: 'Ecloud', INTERACTIVE_BRANCHES: new Set(),
+    EcloudClient: class { async loginInteractive() { return { status: 'failed' }; } async stop() {} },
+    getBeijingDateOnly: () => '2026-11-24', getBeijingTimeString: () => '2026-11-24 12:00:00',
+    appendLog: (...args) => warnings.push(args), sendAccountNotification() {}, sendNotification: async () => ({ success: true }),
+    buildEcloudDefaultFeatures: () => ({ keepAlive: true }),
+    isValidWebhookTarget: safeTargets.isValidWebhookTarget,
+    taskScheduler: { scheduleNextRun: () => { schedules++; }, checkStartupCatchup: async () => {} },
+    ...overrides,
+  });
+  return { ...route, config, clients, events, warnings, getClient,
+    get saves() { return saves; }, get schedules() { return schedules; }, get parses() { return parses; } };
+}
+
+function phase2JsonParser() {
+  return new Function('Buffer', `${phase1ServerFunction('parseJsonBody')}\nreturn parseJsonBody;`)(Buffer);
+}
+
+testAsync('P1-06：JSON Body 按字节限制 2 MiB，边界可解析，超限拒绝 413 且保持旧空/坏 JSON 语义', async () => {
+  const EventEmitter = require('events'), parse = phase2JsonParser(), max = 2 * 1024 * 1024;
+  for (const [input, expected] of [['', {}], ['invalid-json', {}], ['{"ok":true}', { ok: true }]]) {
+    const req = new EventEmitter(), result = parse(req);
+    req.emit('data', Buffer.from(input)); req.emit('end');
+    assert.deepStrictEqual(await result, expected);
+  }
+  const boundary = new EventEmitter(), atLimit = parse(boundary);
+  boundary.emit('data', Buffer.from('"' + 'x'.repeat(max - 2) + '"')); boundary.emit('end');
+  assert.strictEqual((await atLimit).length, max - 2);
+  for (const sample of [{ payload: Buffer.alloc(max + 1), limit: undefined }, { payload: Buffer.from(JSON.stringify('汉汉')), limit: 7 }]) {
+    const req = new EventEmitter(); req.resume = () => {};
+    let failure;
+    const result = parse(req, sample.limit).then(() => {}, error => { failure = error; });
+    req.emit('data', sample.payload); req.emit('end');
+    await result;
+    assert.strictEqual(failure?.statusCode, 413, '超限必须按实际 UTF-8 字节拒绝');
+  }
+});
+
+testAsync('P1-06：Body error/aborted 立即拒绝，迟到的 end/data 不得重新完成或挂起', async () => {
+  const EventEmitter = require('events'), parse = phase2JsonParser();
+  for (const event of ['error', 'aborted']) {
+    const req = new EventEmitter();
+    let state = 'pending', status;
+    const observed = parse(req).then(() => { state = 'resolved'; }, error => { state = 'rejected'; status = error.statusCode; });
+    try {
+      assert.doesNotThrow(() => req.emit(event, new Error('fixture request interrupted')), '请求 error 必须被监听');
+      await phase2Flush();
+      assert.strictEqual(state, 'rejected', '中断请求不能永远 pending');
+      assert.strictEqual(status, 400);
+      req.emit('data', Buffer.from('{}')); req.emit('end');
+      await phase2Flush();
+      assert.strictEqual(state, 'rejected', '迟到事件不得复活解析结果');
+    } finally { req.emit('end'); await observed; }
+  }
+});
+
+testAsync('P1-06：HTTP 顶层异常返回泛化 500，Host 缺失用 localhost，已发头异常销毁响应', async () => {
+  const bases = [];
+  class TrackedURL extends URL { constructor(url, base) { bases.push(base); super(url, base); } }
+  const fallback = phase2ServiceHarness({ overrides: { URL: TrackedURL } }).request('/not-found', 'GET', { host: undefined });
+  await fallback.run();
+  assert.strictEqual(bases[0], 'http://localhost');
+  const broken = phase2ServiceHarness({ overrides: { getSessionFromReq: () => { throw new Error('fixture route detail'); } } }).request('/api/accounts');
+  await assert.doesNotReject(broken.run(), '路由异常必须由顶层兜底');
+  assert.strictEqual(broken.res.statusCode, 500);
+  assert.ok(!broken.res.body.includes('fixture route detail'), '泛化响应不得暴露异常细节');
+  const malformed = phase2ServiceHarness().request('/not-found', 'GET', { host: 'bad host' });
+  await assert.doesNotReject(malformed.run());
+  assert.strictEqual(malformed.res.statusCode, 500);
+  let sent;
+  const afterHeaders = phase2ServiceHarness({ overrides: { getSessionFromReq: () => { sent.res.writeHead(200); throw new Error('fixture after headers'); } } });
+  sent = afterHeaders.request('/api/accounts');
+  await assert.doesNotReject(sent.run());
+  assert.strictEqual(sent.res.destroyed, true, '已发头后不能再写 500 或悬挂响应');
+});
+
+testAsync('P1-06：超限 Body 返回 413，不得继续登录/关机/移动公众保活动作', async () => {
+  const parse = phase2JsonParser();
+  for (const pathName of ['/api/auth/login', '/api/accounts/ct/power/shutdown?desktopId=1', '/api/accounts/ecloud/keepalive']) {
+    let actions = 0;
+    const acc = { id: 'ct', platform: 'ctyun', ownerId: 'fixture-admin', enabled: true, desktops: [{ objId: 1 }], features: { keepAlive: true }, stats: {} };
+    const h = phase2ServiceHarness({ accounts: [acc], overrides: { parseJsonBody: parse,
+      authManager: { login: () => { actions++; return { success: true }; } },
+    } });
+    h.clients.get('ct').controlPower = async () => { actions++; return { success: true }; };
+    const call = h.request(pathName, 'POST'), running = call.run();
+    call.req.resume = () => {};
+    call.req.emit('data', Buffer.alloc(2 * 1024 * 1024 + 1)); call.req.emit('end');
+    await assert.doesNotReject(running);
+    assert.strictEqual(call.res.statusCode, 413, '超限不能被空 Body 兜底吞掉');
+    assert.strictEqual(actions, 0, '拒绝之后不得继续执行控制动作');
+  }
+});
+
+testAsync('P1-06：退出停止所有客户端/调度器并关闭日志，失败不阻断其他清理，2 秒强退只执行一次', async () => {
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    assert.ok(server.includes(`process.on('${signal}', () => { shutdownServer('${signal}'); });`), '信号处理器必须接入真实退出清理');
+  }
+  const vm = require('vm'), source = phase1ServerFunction('shutdownServer');
+  for (const slow of [false, true]) {
+    const clock = phase2FakeClock(), pending = phase2Deferred(), events = [], exits = [];
+    const clients = new Map([
+      ['sidecar', { stop: async () => { events.push('sidecar-stop'); if (slow) await pending.promise; } }],
+      ['ctyun', { stopKeepAliveWorker: () => { events.push('worker-stop'); } }],
+      ['failing', { stop: async () => { events.push('failing-stop'); throw new Error('fixture stop failure'); } }],
+    ]);
+    const stop = vm.runInNewContext(`${source}\nshutdownServer`, { ...clock.globals,
+      serverShuttingDown: false, clientInstances: clients, appendLog() {},
+      taskScheduler: { stop: () => events.push('scheduler-stop') },
+      logPersister: { close: () => events.push('log-close') }, process: { exit: code => { exits.push(code); events.push('exit'); } },
+    });
+    const running = stop('SIGTERM');
+    try {
+      await phase2Flush();
+      if (slow) clock.fire(clock.find(2000));
+      else await running;
+      await stop('SIGINT');
+      assert.deepStrictEqual(exits, [0]);
+      for (const event of ['scheduler-stop', 'sidecar-stop', 'worker-stop', 'failing-stop', 'log-close']) assert.ok(events.includes(event));
+      assert.ok(events.indexOf('log-close') < events.indexOf('exit'));
+      assert.strictEqual(events.filter(x => x === 'log-close').length, 1);
+      assert.strictEqual(clock.timers.size, 0);
+    } finally { pending.resolve(); await running; }
+    assert.deepStrictEqual(exits, [0], '兜底强退后迟到的清理不能重复退出');
+  }
+});
+
+test('P1-06：Auth 配额允许 0，非法/负数回退 2，保存和未知用户返回契约保持', () => {
+  const { AuthManager } = require(path.join(ROOT, 'app/auth_manager.js'));
+  let saves = 0;
+  const user = { id: 'fixture-user', maxQuota: 2 };
+  const auth = Object.create(AuthManager.prototype);
+  auth.configManager = { config: { users: [user] }, saveConfig: () => { saves++; } };
+  for (const [input, expected] of [[0, 0], ['0', 0], [5, 5], ['invalid', 2], [-2, 2], [null, 2], ['', 2]]) {
+    assert.strictEqual(auth.updateUserQuota(user.id, input), true);
+    assert.strictEqual(user.maxQuota, expected, '配额 0 不得被默认值覆盖，负值必须拒绝为默认值');
+  }
+  assert.strictEqual(saves, 7);
+  assert.strictEqual(auth.updateUserQuota('missing', 0), false);
+});
+
+test('P1-06：会话动态同步 username/role/quota/avatar，管理员改名后落盘且不改其他会话', () => {
+  const { AuthManager } = require(path.join(ROOT, 'app/auth_manager.js'));
+  const user = { id: 'fixture-admin', username: 'fixture-current', role: 'admin', maxQuota: 0, avatar: 'fixture-avatar' };
+  let persisted = 0, saved = 0;
+  const auth = Object.create(AuthManager.prototype);
+  auth.configManager = { config: { users: [user] }, saveConfig: () => { saved++; } };
+  const session = { userId: user.id, username: 'fixture-old', role: 'user', maxQuota: 2, expiresAt: Date.now() + 60000 };
+  const other = { userId: 'other', username: 'fixture-other', expiresAt: Date.now() + 60000 };
+  auth.sessions = new Map([['fixture-session', session], ['fixture-other-session', other]]);
+  auth.getUserById = id => id === user.id ? user : null;
+  auth._persistSessions = () => { persisted++; };
+  assert.strictEqual(auth.verifySession('fixture-session').username, user.username, '恢复旧会话必须同步最新用户名');
+  assert.strictEqual(session.role, 'admin'); assert.strictEqual(session.maxQuota, 0); assert.strictEqual(session.avatar, user.avatar);
+  assert.strictEqual(auth.updateAdminUsername(user.username, 'fixture-renamed').success, true);
+  assert.strictEqual(session.username, 'fixture-renamed'); assert.strictEqual(other.username, 'fixture-other');
+  assert.strictEqual(persisted, 1, '管理员改名的会话更新必须落盘'); assert.strictEqual(saved, 1);
+});
+
+test('P1-06：加密入口拒绝非 Buffer/短报文，182 字节边界仍按原布局封包', () => {
+  const Encryption = require(path.join(ROOT, 'app/ctyun_encryption.js'));
+  const cipher = new Encryption();
+  for (const invalid of [null, [], 'fixture', Buffer.alloc(15), Buffer.alloc(181)]) {
+    assert.throws(() => cipher.execute(invalid), /Buffer|182|报文/, '短报文必须抛清晰边界错误');
+  }
+  let calls = 0;
+  cipher.oaepEncrypt = keyLen => { calls++; assert.strictEqual(keyLen, 128); return Buffer.alloc(128); };
+  const result = cipher.execute(Buffer.alloc(182));
+  assert.strictEqual(calls, 1); assert.strictEqual(result.length, 132); assert.strictEqual(result.readUInt32LE(0), 1);
+});
+
+test('P1-06：RSA 结果小于宽度左补零，超过宽度截取尾部，不触发负偏移 copy', () => {
+  const Encryption = require(path.join(ROOT, 'app/ctyun_encryption.js'));
+  const cipher = new Encryption();
+  for (const result of [1n, (1n << (8n * 127n)) | 0x5an, (1n << (8n * 129n)) | 0x5an]) {
+    cipher.modPow = () => result;
+    let output;
+    assert.doesNotThrow(() => { output = cipher.oaepEncrypt(128, '', 2n, 1n); }, '超过 keyLen 时必须先截断而非负偏移 copy');
+    assert.strictEqual(output.length, 128);
+    let hex = result.toString(16); if (hex.length % 2) hex = '0' + hex;
+    const bytes = Buffer.from(hex, 'hex'), expected = Buffer.alloc(128);
+    bytes.subarray(-128).copy(expected, Math.max(0, 128 - bytes.length));
+    assert.deepStrictEqual(output, expected);
+  }
+});
+
+testAsync('P1-06：账号列表按统一开关默认启动，停用/手动关闭/失效只停止一次且不反复启停', async () => {
+  const defaultAcc = { id: 'defaults', platform: 'ctyun', ownerId: 'fixture-admin', enabled: true, features: {}, stats: {} };
+  const normal = phase2ServiceHarness({ accounts: [defaultAcc] });
+  await normal.request('/api/accounts').run(); await normal.request('/api/accounts').run();
+  assert.strictEqual(normal.clients.get(defaultAcc.id).startCalls, 1, '省略 keepAlive 应使用统一默认启用语义');
+  for (const sample of [{ features: { keepAlive: false } }, { manualShutdown: true }, { sessionExpired: true }, { enabled: false }]) {
+    const acc = { id: 'stopped', platform: 'ctyun', ownerId: 'fixture-admin', enabled: true, features: { keepAlive: true }, stats: {}, ...sample };
+    const h = phase2ServiceHarness({ accounts: [acc] }), client = h.clients.get(acc.id);
+    Object.assign(client, { workerRunning: true, wsAlive: true }); client.metrics.status = 'online';
+    await h.request('/api/accounts').run(); await h.request('/api/accounts').run();
+    assert.strictEqual(client.stopKeepAliveCalls, 1, '关闭/失效状态不能每次 GET 都重复停止');
+    assert.strictEqual(client.startCalls, 0); assert.strictEqual(client.metrics.status, 'offline');
+  }
+});
+
+testAsync('P1-06：管理员可全量排序并合并遗漏项，普通用户只排自己，重复 ID 不复制账号', async () => {
+  for (const admin of [false, true]) {
+    const accounts = ['a', 'b', 'c', 'd'].map((id, i) => ({ id, ownerId: i % 2 ? 'other' : 'fixture-owner' }));
+    const h = phase2ServiceHarness({ accounts, session: { role: admin ? 'admin' : 'user', userId: 'fixture-owner' }, body: { orderedIds: ['c', 'b', 'c', 'unknown'] } });
+    const call = h.request('/api/accounts/reorder', 'POST'); await call.run();
+    assert.strictEqual(call.res.statusCode, 200);
+    assert.deepStrictEqual(Array.from(h.config.accounts, a => a.id), admin ? ['c', 'b', 'a', 'd'] : ['b', 'd', 'c', 'a']);
+    assert.strictEqual(new Set(h.config.accounts).size, 4); assert.strictEqual(h.saves, 1);
+  }
+});
+
+testAsync('P1-06：导入配额只计同平台同归属净新增，重复记录/历史 ydpc 推断/覆盖模式均一致', async () => {
+  const session = { role: 'user', userId: 'fixture-owner', username: 'fixture-owner' };
+  const existing = { id: 'existing', user: 'fixture-existing', platform: 'ctyun', ownerId: session.userId, features: { keepAlive: false } };
+  const h = phase2ServiceHarness({ accounts: [existing], session, authUser: { role: 'user', maxQuota: 2 }, body: { accounts: [
+    { user: 'fixture-existing', platform: 'ctyun', name: 'updated' },
+    { user: 'fixture-new', platform: 'ctyun', features: { keepAlive: false } },
+    { user: 'fixture-new', platform: 'ctyun', name: 'new-updated' },
+  ] } });
+  const call = h.request('/api/config/import', 'POST'); await call.run();
+  assert.strictEqual(call.res.statusCode, 200, '已有和重复账号不能占用新增配额');
+  assert.strictEqual(h.config.accounts.length, 2); assert.strictEqual(existing.name, 'updated');
+  assert.strictEqual(h.config.accounts.find(a => a.user === 'fixture-new').name, 'new-updated');
+  for (const mode of ['merge', 'overwrite']) {
+    const acc = { id: 'legacy', platform: 'ydpc', user: 'fixture-legacy', ownerId: session.userId, features: { keepAlive: false } };
+    const item = { user: 'fixture-legacy', accountType: 'main', features: { controlPlaneKeepalive: true, keepAlive: false } };
+    const sample = phase2ServiceHarness({ accounts: [acc], session, authUser: { role: 'user', maxQuota: 1 }, body: { mode, accounts: [item, { ...item }] } });
+    const result = sample.request('/api/config/import', 'POST'); await result.run(); await phase2Flush();
+    assert.strictEqual(result.res.statusCode, 200, '配额计算须复用实际平台推断并去重');
+    assert.strictEqual(sample.config.accounts.length, 1); assert.strictEqual(sample.config.accounts[0].platform, 'ydpc');
+  }
+});
+
+testAsync('P1-06：管理员导入 Webhook 先校验后修改，安全设置恢复后重新挂载调度', async () => {
+  const old = { id: 'old', user: 'fixture-old', platform: 'ecloud', ownerId: 'fixture-admin', features: { keepAlive: false } };
+  const unsafe = phase2ServiceHarness({ accounts: [old], settings: { keepAliveSeconds: 60 }, body: { mode: 'overwrite',
+    accounts: [{ user: 'fixture-new', platform: 'ctyun', features: { keepAlive: false } }],
+    settings: { notify: { enabled: true, channel: 'webhook', webhookUrl: 'http://127.0.0.1/hook' } },
+  } });
+  const rejected = unsafe.request('/api/config/import', 'POST'); await rejected.run();
+  assert.strictEqual(rejected.res.statusCode, 400, '导入不能绕过 Webhook SSRF 校验');
+  assert.strictEqual(unsafe.config.accounts[0], old); assert.strictEqual(unsafe.config.accounts.length, 1);
+  assert.strictEqual(unsafe.saves, 0); assert.strictEqual(unsafe.events.length, 0, '无效设置不能先停掉旧账号');
+  const safe = phase2ServiceHarness({ accounts: [{ ...old, platform: 'ctyun' }], body: {
+    accounts: [{ user: old.user, platform: 'ctyun' }], settings: { keepAliveSeconds: 20, cron: { executeTime: '01:00' },
+      notify: { enabled: true, channel: 'webhook', webhookUrl: 'https://notify.example/hook' } },
+  } });
+  const accepted = safe.request('/api/config/import', 'POST'); await accepted.run();
+  assert.strictEqual(accepted.res.statusCode, 200); assert.strictEqual(safe.config.settings.keepAliveSeconds, 20);
+  assert.strictEqual(safe.schedules, 1, '还原定时配置后必须重挂调度计时器');
+});
+
+testAsync('P1-06：导入 ecloud 不按空密码判 QR，先同步桌面再按统一开关启动，同步失败不启动', async () => {
+  for (const keepAlive of [true, false]) {
+    const h = phase2ServiceHarness({ body: { accounts: [{ platform: 'ecloud', user: 'fixture-ecloud', authMode: 'qrcode', password: '', features: { keepAlive } }] } });
+    const call = h.request('/api/config/import', 'POST'); await call.run(); await phase2Flush();
+    assert.strictEqual(call.res.statusCode, 200); assert.strictEqual(h.config.accounts[0].sessionExpired, false, '显式 ecloud 平台不能被标为天翼云 QR 失效');
+    assert.strictEqual(h.events[0]?.[0], 'refresh', '移动公众必须先同步桌面');
+    assert.strictEqual(h.events.filter(x => x[0] === 'start').length, keepAlive ? 1 : 0);
+    if (keepAlive) assert.ok(h.events.findIndex(x => x[0] === 'start') > h.events.findIndex(x => x[0] === 'refresh'));
+  }
+  let starts = 0;
+  const failed = phase2ServiceHarness({ body: { accounts: [{ platform: 'ecloud', user: 'fixture-failure' }] }, overrides: { getClient: () => ({
+    refreshDesktops: async () => { throw new Error('fixture refresh failure'); }, startKeepAliveWorker: () => { starts++; },
+  }) } });
+  await failed.request('/api/config/import', 'POST').run(); await phase2Flush();
+  assert.strictEqual(starts, 0);
+});
+
+testAsync('P1-06：ecloud 添加失败/抛错释放临时侧车，成功与短信中间态保留所有权', async () => {
+  for (const status of ['failed', 'locked', 'throw', 'fixture-sms', 'success']) {
+    const stops = []; let registered = 0, starts = 0, h;
+    class FakeEcloudClient {
+      constructor(account) { this.account = account; }
+      async loginInteractive() { if (status === 'throw') throw new Error('fixture login failure'); return { status }; }
+      async refreshDesktops() { return []; } async loginSendSms() {}
+      async stop(force) { stops.push(force); } startKeepAliveWorker() { starts++; }
+    }
+    h = phase2ServiceHarness({ body: { user: 'fixture-ecloud', password: 'fixture-password' }, overrides: {
+      EcloudClient: FakeEcloudClient, INTERACTIVE_BRANCHES: new Set(['fixture-sms']),
+      registerPendingEcloudLogin: () => { registered++; },
+      finalizeEcloudAccount: (acc, client) => { h.config.accounts.push(acc); h.clients.set(acc.id, client); client.startKeepAliveWorker(); },
+    } });
+    const call = h.request('/api/accounts/ecloud/add', 'POST'); await call.run();
+    const retained = status === 'fixture-sms' || status === 'success';
+    assert.deepStrictEqual(stops, retained ? [] : [true], '临时失败侧车必须 stop(true)，已移交侧车不能误杀');
+    assert.strictEqual(call.res.statusCode, status === 'success' ? 201 : status === 'fixture-sms' ? 202 : 400);
+    assert.strictEqual(registered, status === 'fixture-sms' ? 1 : 0); assert.strictEqual(starts, status === 'success' ? 1 : 0);
+  }
+});
+
+testAsync('P1-06：删除/覆盖账号优先等待 stop，保留旧平台 Worker 回退且不清理其他归属', async () => {
+  for (const hasStop of [false, true]) {
+    const acc = { id: 'delete', ownerId: 'fixture-admin', platform: hasStop ? 'ecloud' : 'ctyun' };
+    const h = phase2ServiceHarness({ accounts: [acc] }), client = h.clients.get(acc.id);
+    let stops = 0;
+    if (hasStop) client.stop = async () => { stops++; };
+    const call = h.request('/api/accounts/delete', 'DELETE'); await call.run();
+    assert.strictEqual(call.res.statusCode, 200); assert.strictEqual(stops, hasStop ? 1 : 0);
+    assert.strictEqual(client.stopKeepAliveCalls, hasStop ? 0 : 1); assert.strictEqual(h.clients.has(acc.id), false);
+  }
+  const own = { id: 'own', platform: 'ecloud', ownerId: 'fixture-owner' }, other = { id: 'other', platform: 'ecloud', ownerId: 'other' };
+  const h = phase2ServiceHarness({ accounts: [own, other], session: { role: 'user', userId: own.ownerId }, body: { mode: 'overwrite', accounts: [{ user: 'fixture-new', platform: 'ctyun', features: { keepAlive: false } }] } });
+  let ownStops = 0, otherStops = 0;
+  h.clients.get(own.id).stop = async () => { ownStops++; }; h.clients.get(other.id).stop = async () => { otherStops++; };
+  await h.request('/api/config/import', 'POST').run();
+  assert.strictEqual(ownStops, 1); assert.strictEqual(otherStops, 0); assert.strictEqual(h.clients.has(other.id), true);
+});
+
+testAsync('P1-06：天翼云专属路由在客户端调用前拒绝两个移动平台，legacy 天翼云仍可用', async () => {
+  for (const platform of ['ydpc', 'ecloud']) for (const [suffix, method] of [['web-active', 'POST'], ['web-close', 'POST'], ['web-launch', 'GET'], ['order', 'POST'], ['desktops', 'GET']]) {
+    let invocations = 0, h;
+    const acc = { id: 'mobile', platform, ownerId: 'fixture-admin' };
+    h = phase2ServiceHarness({ accounts: [acc], overrides: { getClient: account => { invocations++; return h.clients.get(account.id); } } });
+    const call = h.request(`/api/accounts/mobile/${suffix}`, method); await call.run();
+    assert.strictEqual(call.res.statusCode, 400, '非天翼云形态接口必须明确拒绝');
+    assert.strictEqual(invocations, 0, '不能先取得/操作移动客户端再靠 TypeError 兜底');
+  }
+  const legacy = phase2ServiceHarness({ accounts: [{ id: 'legacy', ownerId: 'fixture-admin' }] });
+  const call = legacy.request('/api/accounts/legacy/web-active', 'POST'); await call.run();
+  assert.strictEqual(call.res.statusCode, 200, '缺失 platform 的历史天翼云必须继续可用');
+});
+
+testAsync('P1-06：商品查询和设置周期热更新只触达天翼云客户端，移动平台指标不被覆盖', async () => {
+  const accounts = ['ydpc', 'ecloud', 'ctyun'].map((platform, i) => ({ id: String(i), platform, ownerId: 'fixture-admin' }));
+  let h; const queried = [];
+  h = phase2ServiceHarness({ accounts, body: { keepAliveSeconds: 20 }, overrides: { getClient: acc => { queried.push(acc.platform); return h.clients.get(acc.id); } } });
+  await h.request('/api/rewards').run();
+  assert.deepStrictEqual(queried, ['ctyun'], '奖励查询不能对移动平台试错调用');
+  for (const [id, client] of h.clients) { client.metrics.keepAliveSeconds = 77; client.metrics.cycleCountdown = 66;
+    client.resetCycleTimeout = seconds => { client.metrics.keepAliveSeconds = seconds; client.metrics.cycleCountdown = seconds; }; }
+  const settings = h.request('/api/settings', 'PUT'); await settings.run();
+  assert.strictEqual(settings.res.statusCode, 200); assert.strictEqual(h.schedules, 1);
+  for (const [id, client] of h.clients) assert.strictEqual(client.metrics.keepAliveSeconds, id === '2' ? 20 : 77, '移动平台不能套用天翼云周期');
+});
+
+testAsync('P1-06：扫码按 ID/手机号均不能覆写 ecloud，合法天翼云重新授权保持', async () => {
+  class FakeCtYunClient {
+    async getQrCodeStatus() { return { codeStatus: 'authorize', loginToken: 'fixture-qr-code' }; }
+    async loginByToken() { return { mobilephone: 'fixture-qr-user', userName: 'fixture-qr-user' }; }
+  }
+  for (const platform of ['ecloud', 'ctyun']) for (const byId of [false, true]) {
+    const acc = { id: 'qr-existing', platform, user: 'fixture-qr-user', ownerId: 'fixture-admin', stats: {} };
+    const h = phase2ServiceHarness({ accounts: [acc], overrides: { CtYunClient: FakeCtYunClient } });
+    const call = h.request('/api/account/qrcode/status?qrCodeId=fixture-code' + (byId ? '&accId=qr-existing' : ''));
+    await call.run();
+    assert.strictEqual(call.res.statusCode, 200);
+    assert.strictEqual(h.config.accounts.length, platform === 'ecloud' ? 2 : 1, '移动公众必须新建天翼云绑定而非覆写原账号');
+    assert.strictEqual(acc.platform, platform);
+    if (platform === 'ecloud') assert.strictEqual(acc.savedLoginInfo, undefined, '移动公众不能接收天翼云会话');
+    else assert.ok(acc.savedLoginInfo, '天翼云重新授权仍应恢复会话');
+  }
+});
+
+testAsync('P1-06：配额 0 在三平台添加与导入入口也生效，不被路由默认值回退到 2', async () => {
+  for (const pathname of ['/api/accounts', '/api/accounts/ydpc/add', '/api/accounts/ecloud/add', '/api/config/import']) {
+    const h = phase2ServiceHarness({ session: { role: 'user', userId: 'fixture-owner' }, authUser: { role: 'user', maxQuota: 0 },
+      body: { user: 'fixture-user', password: 'fixture-password', accounts: [{ user: 'fixture-user', platform: 'ctyun', features: { keepAlive: false } }] } });
+    const call = h.request(pathname, 'POST'); await call.run();
+    assert.strictEqual(call.res.statusCode, 400); assert.match(call.res.body, /配额/);
+    assert.strictEqual(h.config.accounts.length, 0, '配额 0 不允许新增账号');
+    if (pathname !== '/api/config/import') assert.strictEqual(h.parses, 0, '添加配额应在登录/Body 处理前拒绝');
+  }
+});
+
+testAsync('P1-06：单机关机仅关闭该机守护，全机关/已关机才暂停账号，显式开机恢复该机', async () => {
+  const desktops = [{ objId: 1, useStatus: 25, useStatusText: '运行中', keepaliveEnabled: true }, { objId: 2, useStatus: 25, useStatusText: '运行中', keepaliveEnabled: true }];
+  const acc = { id: 'power', platform: 'ctyun', ownerId: 'fixture-admin', enabled: true, features: { keepAlive: true, autoSign: false }, manualShutdown: false, stats: {}, desktops };
+  const h = phase2ServiceHarness({ accounts: [acc] }), client = h.clients.get(acc.id);
+  client.workerRunning = true;
+  await h.request('/api/accounts/power/power/shutdown?desktopId=1', 'POST').run();
+  assert.strictEqual(desktops[0].keepaliveEnabled, false); assert.strictEqual(desktops[1].keepaliveEnabled, true);
+  assert.strictEqual(acc.features.keepAlive, true, '关闭某台不能关闭其他运行中桌面的守护'); assert.strictEqual(acc.manualShutdown, false);
+  assert.strictEqual(client.stopKeepAliveCalls, 0); assert.strictEqual(acc.features.autoSign, false);
+  await h.request('/api/accounts/power/power/shutdown?desktopId=2', 'POST').run();
+  assert.strictEqual(acc.features.keepAlive, false); assert.strictEqual(acc.manualShutdown, true); assert.strictEqual(client.stopKeepAliveCalls, 1);
+  await h.request('/api/accounts/power/power/poweron?desktopId=1', 'POST').run();
+  assert.strictEqual(desktops[0].keepaliveEnabled, true, '显式开机必须恢复该台守护以维持原联动语义');
+  assert.strictEqual(desktops[1].keepaliveEnabled, false); assert.strictEqual(acc.features.keepAlive, true); assert.strictEqual(acc.manualShutdown, false);
+  for (const state of [{ useStatus: 0, useStatusText: '已关机' }, { useStatus: 0 }]) {
+    const other = { objId: 2, keepaliveEnabled: true, ...state };
+    const account = { ...acc, id: 'state', manualShutdown: false, features: { keepAlive: true }, desktops: [{ ...desktops[0] }, other] };
+    const sample = phase2ServiceHarness({ accounts: [account] });
+    await sample.request('/api/accounts/state/power/shutdown?desktopId=1', 'POST').run();
+    assert.strictEqual(account.features.keepAlive, !state.useStatusText, '只有明确关机证据才可判全关，不能把未知枚举当已关机');
+  }
 });
 
 // ============================================================================

@@ -6,6 +6,9 @@ class CtYunEncryption {
   }
 
   execute(data) {
+    if (!Buffer.isBuffer(data) || data.length < 16 + 166) {
+      throw new Error('保活加密报文必须为至少 182 字节的 Buffer');
+    }
     const inbound = data.subarray(16);
     // 提取 N (129 字节，从 32 开始)
     const nBuf = inbound.subarray(32, 32 + 129);
@@ -62,6 +65,7 @@ class CtYunEncryption {
     const resultBytes = Buffer.from(hex, 'hex');
 
     if (resultBytes.length === keyLen) return resultBytes;
+    if (resultBytes.length > keyLen) return resultBytes.subarray(-keyLen);
     const finalBuf = Buffer.alloc(keyLen);
     resultBytes.copy(finalBuf, keyLen - resultBytes.length);
     return finalBuf;

@@ -1843,6 +1843,195 @@ const MUTATIONS = [
     from: "    if (acc.enabled === false || acc.platform === 'ydpc' || acc.platform === 'ecloud' || !acc.features?.autoRedeem) return;",
     to: '    if (acc.enabled === false || !acc.features?.autoRedeem) return;',
   },
+  {
+    id: 'M219', name: 'P1-06：JSON Body 超限闸门失效', file: 'server.js',
+    from: '      if (bytes > maxBytes) {', to: '      if (false) {',
+  },
+  {
+    id: 'M220', name: 'P1-06：Body error 再次无人监听', file: 'server.js',
+    from: "    req.on('error', () => fail(400, '请求体读取失败'));", to: '',
+  },
+  {
+    id: 'M221', name: 'P1-06：Body aborted 再次悬挂', file: 'server.js',
+    from: "    req.on('aborted', () => fail(400, '请求已中断'));", to: '',
+  },
+  {
+    id: 'M222', name: 'P1-06：Host 缺失不再回退 localhost', file: 'server.js',
+    from: "const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);",
+    to: 'const parsedUrl = new URL(req.url, `http://${req.headers.host}`);',
+  },
+  {
+    id: 'M223', name: 'P1-06：HTTP 顶层异常重新向外拒绝', file: 'server.js',
+    from: '  } catch (err) {\n    if (res.writableEnded || res.destroyed) return;',
+    to: '  } catch (err) {\n    throw err;\n    if (res.writableEnded || res.destroyed) return;',
+  },
+  {
+    id: 'M224', name: 'P1-06：泛化 500 重新泄露异常细节', file: 'server.js',
+    from: "(status === 400 ? '请求读取失败' : '服务器内部错误')",
+    to: "(status === 400 ? '请求读取失败' : String(err?.message || '服务器内部错误'))",
+  },
+  {
+    id: 'M225', name: 'P1-06：已发头异常不再销毁响应', file: 'server.js',
+    from: '    if (res.headersSent) {\n      res.destroy();\n      return;\n    }\n    jsonResponse(res, { error: status',
+    to: '    if (res.headersSent) {\n      return;\n    }\n    jsonResponse(res, { error: status',
+  },
+  {
+    id: 'M226', name: 'P1-06：添加失败的临时 ecloud 侧车不再释放', file: 'server.js',
+    from: '      if (draftClient && !draftRetained) await draftClient.stop(true);', to: '',
+  },
+  {
+    id: 'M227', name: 'P1-06：已移交的成功/短信侧车被误杀', file: 'server.js',
+    from: 'if (draftClient && !draftRetained) await draftClient.stop(true);', to: 'if (draftClient) await draftClient.stop(true);',
+  },
+  {
+    id: 'M228', name: 'P1-06：删除账号不再优先停止侧车', file: 'server.js',
+    from: "        if (typeof client.stop === 'function') await client.stop();\n        else client.stopKeepAliveWorker();",
+    to: '        client.stopKeepAliveWorker();',
+  },
+  {
+    id: 'M229', name: 'P1-06：覆盖账号不再优先停止侧车', file: 'server.js',
+    from: "          if (typeof cl.stop === 'function') await cl.stop();\n          else cl.stopKeepAliveWorker();",
+    to: '          cl.stopKeepAliveWorker();',
+  },
+  {
+    id: 'M230', name: 'P1-06：退出清理失去两秒兜底', file: 'server.js',
+    from: '  forceTimer = setTimeout(finish, 2000);', to: '',
+  },
+  {
+    id: 'M231', name: 'P1-06：退出路径再次不调用客户端 stop', file: 'server.js',
+    from: "\n    if (typeof client.stop === 'function') await client.stop();", to: '\n    if (false) await client.stop();',
+  },
+  {
+    id: 'M232', name: 'P1-06：退出前不再关闭日志持久化', file: 'server.js',
+    from: '    try { logPersister.close(); } catch (e) { /* 不阻断退出 */ }', to: '',
+  },
+  {
+    id: 'M233', name: 'P1-06：账号列表再次忽略省略 keepAlive 的默认开启', file: 'server.js',
+    from: "const keepAliveEnabled = resolveTaskEnabled(acc, null, 'keepAlive').enabled;", to: 'const keepAliveEnabled = acc.features?.keepAlive === true;',
+  },
+  {
+    id: 'M234', name: 'P1-06：关闭账号每次 GET 都重复停止', file: 'server.js',
+    from: 'if (client.workerRunning || client.wsAlive) client.stopKeepAliveWorker();', to: 'client.stopKeepAliveWorker();',
+  },
+  {
+    id: 'M235', name: 'P1-06：失效会话在列表同步时被忽略', file: 'server.js',
+    from: 'if (!keepAliveEnabled || acc.manualShutdown === true || acc.sessionExpired === true)',
+    to: 'if (!keepAliveEnabled || acc.manualShutdown === true)',
+  },
+  {
+    id: 'M236', name: 'P1-06：管理员排序再次仅处理自己的账号', file: 'server.js',
+    from: "const userAccounts = session.role === 'admin' ? appConfig.accounts : appConfig.accounts.filter(a => a.ownerId === session.userId);",
+    to: 'const userAccounts = appConfig.accounts.filter(a => a.ownerId === session.userId);',
+  },
+  {
+    id: 'M237', name: 'P1-06：重复排序 ID 复制账号', file: 'server.js',
+    from: 'if (found && !reordered.includes(found)) reordered.push(found);', to: 'if (found) reordered.push(found);',
+  },
+  {
+    id: 'M238', name: 'P1-06：导入配额重新按原始列表长度计数', file: 'server.js',
+    from: 'currentOwned + netNewCount > (currentUser.maxQuota ?? 2)', to: 'currentOwned + importAccounts.length > (currentUser.maxQuota ?? 2)',
+  },
+  {
+    id: 'M239', name: 'P1-06：移动公众平台被误判天翼云扫码账号', file: 'server.js',
+    from: "const isQrAccount = !isYdpc && !isEcloud && (item.authMode === 'qrcode' || !item.password);",
+    to: "const isQrAccount = !isYdpc && (item.authMode === 'qrcode' || !item.password);",
+  },
+  {
+    id: 'M240', name: 'P1-06：导入 ecloud 跳过同步直接启动', file: 'server.js',
+    from: '      } else if (isEcloud) {\n        client.refreshDesktops().then(() => {',
+    to: '      } else if (isEcloud) {\n        Promise.resolve().then(() => {',
+  },
+  {
+    id: 'M241', name: 'P1-06：导入设置绕过 Webhook SSRF 校验', file: 'server.js',
+    from: "if (!isValidWebhookTarget(notify.channel || 'webhook', String(notify.webhookUrl).trim())) {", to: 'if (false) {',
+  },
+  {
+    id: 'M242', name: 'P1-06：导入定时设置后不再重挂调度', file: 'server.js',
+    from: '      appConfig.settings = { ...appConfig.settings, ...body.settings };\n      if (taskScheduler) taskScheduler.scheduleNextRun();',
+    to: '      appConfig.settings = { ...appConfig.settings, ...body.settings };',
+  },
+  {
+    id: 'M243', name: 'P1-06：五类天翼云专属路由平台守卫被移除', file: 'server.js',
+    from: "if (acc.platform && acc.platform !== 'ctyun') { jsonResponse(res, { error: '此接口仅支持天翼云账号' }, 400); return; }", to: '', replaceAll: true,
+  },
+  {
+    id: 'M244', name: 'P1-06：商品查询再次调用移动客户端', file: 'server.js',
+    from: "      if (acc.platform && acc.platform !== 'ctyun') continue;", to: '',
+  },
+  {
+    id: 'M245', name: 'P1-06：设置周期再次覆写移动平台', file: 'server.js',
+    from: "      if (!acc || (acc.platform && acc.platform !== 'ctyun')) continue;", to: '',
+  },
+  {
+    id: 'M246', name: 'P1-06：扫码按 ID 可以覆写 ecloud', file: 'server.js',
+    from: "existingAcc = appConfig.accounts.find(a => a.id === targetAccId && a.ownerId === currentOwnerId && a.platform !== 'ydpc' && a.platform !== 'ecloud');",
+    to: "existingAcc = appConfig.accounts.find(a => a.id === targetAccId && a.ownerId === currentOwnerId && a.platform !== 'ydpc');",
+  },
+  {
+    id: 'M247', name: 'P1-06：扫码按手机号可以覆写 ecloud', file: 'server.js',
+    from: "existingAcc = appConfig.accounts.find(a => (a.user === userPhone || a.user === userPhone.replace(/(\\d{3})\\d{4}(\\d{4})/, '$1****$2')) && a.ownerId === currentOwnerId && a.platform !== 'ydpc' && a.platform !== 'ecloud');",
+    to: "existingAcc = appConfig.accounts.find(a => (a.user === userPhone || a.user === userPhone.replace(/(\\d{3})\\d{4}(\\d{4})/, '$1****$2')) && a.ownerId === currentOwnerId && a.platform !== 'ydpc');",
+  },
+  {
+    id: 'M248', name: 'P1-06：配额 0 在路由中再次回退到 2', file: 'server.js',
+    from: 'currentUser.maxQuota ?? 2', to: 'currentUser.maxQuota || 2', replaceAll: true,
+  },
+  {
+    id: 'M249', name: 'P1-06：Auth 配额 0 再次被默认值覆盖', file: 'app/auth_manager.js',
+    from: 'user.maxQuota = (Number.isFinite(parsed) && parsed >= 0) ? parsed : 2;', to: 'user.maxQuota = parsed || 2;',
+  },
+  {
+    id: 'M250', name: 'P1-06：验证会话不再同步最新 username', file: 'app/auth_manager.js',
+    from: '      session.username = user.username;', to: '',
+  },
+  {
+    id: 'M251', name: 'P1-06：管理员改名的会话不再落盘', file: 'app/auth_manager.js',
+    from: '    this._persistSessions();\n    this.configManager.saveConfig();\n    return { success: true, newUsername: cleanNew };',
+    to: '    this.configManager.saveConfig();\n    return { success: true, newUsername: cleanNew };',
+  },
+  {
+    id: 'M252', name: 'P1-06：加密入口再次接受短/非 Buffer 报文', file: 'app/ctyun_encryption.js',
+    from: "    if (!Buffer.isBuffer(data) || data.length < 16 + 166) {\n      throw new Error('保活加密报文必须为至少 182 字节的 Buffer');\n    }", to: '',
+  },
+  {
+    id: 'M253', name: 'P1-06：超宽 RSA 结果再次负偏移 copy', file: 'app/ctyun_encryption.js',
+    from: '    if (resultBytes.length > keyLen) return resultBytes.subarray(-keyLen);', to: '',
+  },
+  {
+    id: 'M254', name: 'P1-06：单机关机再次关闭整个账号守护', file: 'server.js',
+    from: '          if (allDesktopsClosed) {', to: '          if (true) {',
+  },
+  {
+    id: 'M255', name: 'P1-06：关机不再关闭目标桌面的独立守护', file: 'server.js',
+    from: '          if (desktop) desktop.keepaliveEnabled = false;\n          if (savedDesktop) savedDesktop.keepaliveEnabled = false;', to: '',
+  },
+  {
+    id: 'M256', name: 'P1-06：显式开机不再恢复该台桌面的守护', file: 'server.js',
+    from: '          if (desktop) desktop.keepaliveEnabled = true;\n          if (savedDesktop) savedDesktop.keepaliveEnabled = true;', to: '',
+  },
+  {
+    id: 'M257', name: 'P1-06：未知桌面状态被误当已关机', file: 'server.js',
+    from: "d.keepaliveEnabled === false || d.useStatusText === '已关机' || d.useStatusText === '关机');",
+    to: "d.keepaliveEnabled === false || d.useStatusText === '已关机' || d.useStatusText === '关机' || d.useStatus === 0);",
+  },
+  {
+    id: 'M258', name: 'P1-06：电源路由吞掉超限 Body 后继续动作', file: 'server.js',
+    from: '    const body = await parseJsonBody(req);\n    const client = getClient(acc);\n    try {\n      const actionLower = (action || \'\').toLowerCase();',
+    to: '    const body = await parseJsonBody(req).catch(() => ({}));\n    const client = getClient(acc);\n    try {\n      const actionLower = (action || \'\').toLowerCase();',
+  },
+  {
+    id: 'M259', name: 'P1-06：移动公众保活路由吞掉超限 Body', file: 'server.js',
+    from: "    const body = await parseJsonBody(req);\n    const acc = appConfig.accounts.find(a => a.id === body.accountId && a.platform === 'ecloud');",
+    to: "    const body = await parseJsonBody(req).catch(() => ({}));\n    const acc = appConfig.accounts.find(a => a.id === body.accountId && a.platform === 'ecloud');",
+  },
+  {
+    id: 'M260', name: 'P1-06：SIGINT 绕过真实退出清理', file: 'server.js',
+    from: "process.on('SIGINT', () => { shutdownServer('SIGINT'); });", to: "process.on('SIGINT', () => { process.exit(0); });",
+  },
+  {
+    id: 'M261', name: 'P1-06：默认 Body 上限被扩大到 4 MiB', file: 'server.js',
+    from: 'function parseJsonBody(req, maxBytes = 2 * 1024 * 1024)', to: 'function parseJsonBody(req, maxBytes = 4 * 1024 * 1024)',
+  },
 ];
 
 // ---------------------------------------------------------------------------

@@ -44,14 +44,36 @@ process.on('exit', (code) => {
     appendLog('System', `⚠️ 主进程即将退出 (code=${code})${code === 0 ? '' : ' —— 非零退出码，请对照上一条异常/信号日志'}`, code === 0 ? 'warning' : 'error');
   } catch (e) { /* 退出路径尽力而为 */ }
 });
-process.on('SIGINT', () => {
-  try { appendLog('System', '收到 SIGINT (Ctrl+C)，主进程即将退出', 'warning'); } catch (e) { /* 同上 */ }
-  process.exit(0);
-});
-process.on('SIGTERM', () => {
-  try { appendLog('System', '收到 SIGTERM，主进程即将退出', 'warning'); } catch (e) { /* 同上 */ }
-  process.exit(0);
-});
+let serverShuttingDown = false;
+async function shutdownServer(signal) {
+  if (serverShuttingDown) return;
+  serverShuttingDown = true;
+  try { appendLog('System', `收到 ${signal}，正在停止客户端与调度器`, 'warning'); } catch (e) { /* 同上 */ }
+  let finished = false;
+  let forceTimer = null;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    if (forceTimer) clearTimeout(forceTimer);
+    try { appendLog('System', '主进程即将退出 (code=0)', 'warning'); } catch (e) { /* 退出路径尽力而为 */ }
+    try { logPersister.close(); } catch (e) { /* 不阻断退出 */ }
+    process.exit(0);
+  };
+  forceTimer = setTimeout(finish, 2000);
+  try { taskScheduler.stop(); } catch (e) {
+    try { appendLog('System', '停止调度器失败，将继续清理客户端', 'warning'); } catch (logError) { /* 同上 */ }
+  }
+  const results = await Promise.allSettled([...clientInstances.values()].map(async (client) => {
+    if (typeof client.stop === 'function') await client.stop();
+    else if (typeof client.stopKeepAliveWorker === 'function') client.stopKeepAliveWorker();
+  }));
+  if (results.some(result => result.status === 'rejected')) {
+    try { appendLog('System', '部分客户端清理失败，已继续执行其余退出清理', 'warning'); } catch (e) { /* 同上 */ }
+  }
+  finish();
+}
+process.on('SIGINT', () => { shutdownServer('SIGINT'); });
+process.on('SIGTERM', () => { shutdownServer('SIGTERM'); });
 
 const PORT = process.env.PORT || 8571;
 const DATA_DIR = process.env.CTYUN_DATA_DIR || path.join(__dirname, 'data');
@@ -3591,17 +3613,43 @@ function serveStatic(res, filePath, contentType) {
   });
 }
 
-function parseJsonBody(req) {
-  return new Promise((resolve) => {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
+function parseJsonBody(req, maxBytes = 2 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let bytes = 0;
+    let settled = false;
+    const fail = (statusCode, message) => {
+      if (settled) return;
+      settled = true;
+      chunks.length = 0;
+      const error = new Error(message);
+      error.statusCode = statusCode;
+      reject(error);
+    };
+    req.on('data', chunk => {
+      if (settled) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.length;
+      if (bytes > maxBytes) {
+        fail(413, '请求体超过允许大小');
+        if (typeof req.resume === 'function') req.resume();
+        return;
+      }
+      chunks.push(buffer);
+    });
     req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      const body = Buffer.concat(chunks).toString('utf8');
       try {
         resolve(JSON.parse(body || '{}'));
       } catch (e) {
         resolve({});
       }
     });
+    req.on('error', () => fail(400, '请求体读取失败'));
+    req.on('aborted', () => fail(400, '请求已中断'));
+    if (req.aborted) fail(400, '请求已中断');
   });
 }
 
@@ -3769,7 +3817,8 @@ async function proxyStaticAsset(res, targetUrl) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
+  try {
+  const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = parsedUrl.pathname;
 
   if (req.method === 'OPTIONS') {
@@ -4588,11 +4637,12 @@ function rewardNeedsDesktop(prodId, prodType) {
         }
       }
 
-      if (acc.features?.keepAlive === false || acc.manualShutdown === true) {
-        client.stopKeepAliveWorker();
+      const keepAliveEnabled = resolveTaskEnabled(acc, null, 'keepAlive').enabled;
+      if (!keepAliveEnabled || acc.manualShutdown === true || acc.sessionExpired === true) {
+        if (client.workerRunning || client.wsAlive) client.stopKeepAliveWorker();
         client.metrics.status = 'offline';
         client.metrics.cycleCountdown = client.metrics.keepAliveSeconds || 60;
-      } else if (acc.enabled && acc.features?.keepAlive === true) {
+      } else {
         if (!client.workerRunning) {
           client.startKeepAliveWorker();
         }
@@ -4677,12 +4727,12 @@ function rewardNeedsDesktop(prodId, prodType) {
     const body = await parseJsonBody(req);
     const orderedIds = body.orderedIds;
     if (Array.isArray(orderedIds)) {
-      const userAccounts = appConfig.accounts.filter(a => a.ownerId === session.userId);
-      const otherAccounts = appConfig.accounts.filter(a => a.ownerId !== session.userId);
+      const userAccounts = session.role === 'admin' ? appConfig.accounts : appConfig.accounts.filter(a => a.ownerId === session.userId);
+      const otherAccounts = session.role === 'admin' ? [] : appConfig.accounts.filter(a => a.ownerId !== session.userId);
       const reordered = [];
       for (const id of orderedIds) {
         const found = userAccounts.find(a => a.id === id);
-        if (found) reordered.push(found);
+        if (found && !reordered.includes(found)) reordered.push(found);
       }
       for (const a of userAccounts) {
         if (!reordered.includes(a)) reordered.push(a);
@@ -4764,7 +4814,7 @@ function rewardNeedsDesktop(prodId, prodType) {
     const currentUser = authManager.getUserById(currentOwnerId);
     if (currentUser && currentUser.role !== 'admin') {
       const currentOwned = appConfig.accounts.filter(a => a.ownerId === currentOwnerId).length;
-      const userMax = currentUser.maxQuota || 2;
+      const userMax = currentUser.maxQuota ?? 2;
       if (currentOwned >= userMax) {
         jsonResponse(res, {
           error: `已达到云电脑添加配额上限（当前配额: ${userMax}台），无法继续添加！请联系管理员提高配额。`
@@ -4859,7 +4909,7 @@ function rewardNeedsDesktop(prodId, prodType) {
     const currentUser = authManager.getUserById(currentOwnerId);
     if (currentUser && currentUser.role !== 'admin') {
       const currentOwned = appConfig.accounts.filter(a => a.ownerId === currentOwnerId).length;
-      const userMax = currentUser.maxQuota || 2;
+      const userMax = currentUser.maxQuota ?? 2;
       if (currentOwned >= userMax) {
         jsonResponse(res, { error: `已达到云电脑添加配额上限（当前配额: ${userMax}台），无法继续添加！请联系管理员提高配额。` }, 400);
         return;
@@ -4895,8 +4945,10 @@ function rewardNeedsDesktop(prodId, prodType) {
       createdAt: new Date().toISOString()
     };
 
+    let draftClient = null;
+    let draftRetained = false;
     try {
-      const draftClient = new EcloudClient(draftAcc, {
+      draftClient = new EcloudClient(draftAcc, {
         appendLog,
         sendNotification: sendAccountNotification,
         saveConfig: () => saveConfig(appConfig),
@@ -4908,6 +4960,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       if (status === 'success') {
         const desktops = await draftClient.refreshDesktops().catch(() => []);
         finalizeEcloudAccount(draftAcc, draftClient);
+        draftRetained = true;
         appendLog(ECLOUD_LOG_SOURCE, `[${name}] 移动公众账号添加成功，发现 ${desktops.length} 台云电脑，已启动独立保活守护`, 'success', name, 'ecloud');
         jsonResponse(res, { success: true, account: sanitizeAccountForClient(draftAcc), desktops }, 201);
         return;
@@ -4918,6 +4971,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         draftClient.account = draftAcc;
         const mobile = (r && r.mobile) || '';
         registerPendingEcloudLogin(accId, { acc: draftAcc, client: draftClient, branch: status, mobile });
+        draftRetained = true;
         appendLog(ECLOUD_LOG_SOURCE, `[${name}] 移动公众登录需要短信验证（分支 ${status}），正在下发验证码…`, 'warning', name, 'ecloud');
 
         // ⚠️ 必须真正发码：服务端**不会**因为密码登录要求二次验证就替我们发短信，
@@ -4953,6 +5007,8 @@ function rewardNeedsDesktop(prodId, prodType) {
     } catch (e) {
       appendLog(ECLOUD_LOG_SOURCE, `[${name}] 添加移动公众账号失败: ${e.message}`, 'error', name, 'ecloud');
       jsonResponse(res, { error: e.message || '移动公众认证失败' }, 400);
+    } finally {
+      if (draftClient && !draftRetained) await draftClient.stop(true);
     }
     return;
   }
@@ -5018,7 +5074,7 @@ function rewardNeedsDesktop(prodId, prodType) {
   if (req.method === 'POST' && pathname === '/api/accounts/ecloud/keepalive') {
     const session = getSessionFromReq(req);
     if (!session) { jsonResponse(res, { error: '未授权' }, 401); return; }
-    const body = await parseJsonBody(req).catch(() => ({}));
+    const body = await parseJsonBody(req);
     const acc = appConfig.accounts.find(a => a.id === body.accountId && a.platform === 'ecloud');
     if (!acc) { jsonResponse(res, { error: '未找到该移动公众账号' }, 404); return; }
     if (!canUserAccessAccount(session, acc)) { jsonResponse(res, { error: '权限不足：无权操作该账号' }, 403); return; }
@@ -5047,7 +5103,7 @@ function rewardNeedsDesktop(prodId, prodType) {
     // 配额限制判断：普通用户受配额上限约束，管理员无限制
     if (currentUser && currentUser.role !== 'admin') {
       const currentOwned = appConfig.accounts.filter(a => a.ownerId === currentOwnerId).length;
-      const userMax = currentUser.maxQuota || 2;
+      const userMax = currentUser.maxQuota ?? 2;
       if (currentOwned >= userMax) {
         jsonResponse(res, {
           error: `已达到云电脑添加配额上限（当前配额: ${userMax}台），无法继续添加！请联系管理员提高配额。`
@@ -5392,7 +5448,10 @@ function rewardNeedsDesktop(prodId, prodType) {
     if (idx >= 0) {
       const deleted = appConfig.accounts.splice(idx, 1)[0];
       const client = clientInstances.get(accId);
-      if (client) client.stopKeepAliveWorker();
+      if (client) {
+        if (typeof client.stop === 'function') await client.stop();
+        else client.stopKeepAliveWorker();
+      }
       clientInstances.delete(accId);
 
       saveConfig(appConfig);
@@ -5520,10 +5579,10 @@ function rewardNeedsDesktop(prodId, prodType) {
         // 检查是否为已有账号重新扫码授权 (通过 accId 指定或同用户同手机号)
         let existingAcc = null;
         if (targetAccId) {
-          existingAcc = appConfig.accounts.find(a => a.id === targetAccId && a.ownerId === currentOwnerId);
+          existingAcc = appConfig.accounts.find(a => a.id === targetAccId && a.ownerId === currentOwnerId && a.platform !== 'ydpc' && a.platform !== 'ecloud');
         }
         if (!existingAcc) {
-          existingAcc = appConfig.accounts.find(a => (a.user === userPhone || a.user === userPhone.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2')) && a.ownerId === currentOwnerId && a.platform !== 'ydpc');
+          existingAcc = appConfig.accounts.find(a => (a.user === userPhone || a.user === userPhone.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2')) && a.ownerId === currentOwnerId && a.platform !== 'ydpc' && a.platform !== 'ecloud');
         }
 
         if (existingAcc) {
@@ -5554,7 +5613,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         const currentUser = authManager.getUserById(currentOwnerId);
         if (currentUser && currentUser.role !== 'admin') {
           const currentOwned = appConfig.accounts.filter(a => a.ownerId === currentOwnerId).length;
-          const userMax = currentUser.maxQuota || 2;
+          const userMax = currentUser.maxQuota ?? 2;
           if (currentOwned >= userMax) {
             jsonResponse(res, {
               error: `已达到云电脑添加配额上限（当前配额: ${userMax}台），无法继续添加！请联系管理员提高配额。`
@@ -5929,6 +5988,7 @@ function rewardNeedsDesktop(prodId, prodType) {
     const accId = pathname.split('/')[3];
     const acc = appConfig.accounts.find(a => a.id === accId);
     if (acc && canUserAccessAccount(session, acc)) {
+      if (acc.platform && acc.platform !== 'ctyun') { jsonResponse(res, { error: '此接口仅支持天翼云账号' }, 400); return; }
       const client = getClient(acc);
       // 保持避让：只要前台网页还在打开操作，每次心跳刷新避让有效期 (延长 15 秒)
       client.yieldToWebUser(0.25);
@@ -5949,6 +6009,7 @@ function rewardNeedsDesktop(prodId, prodType) {
     const accId = pathname.split('/')[3];
     const acc = appConfig.accounts.find(a => a.id === accId);
     if (acc && canUserAccessAccount(session, acc)) {
+      if (acc.platform && acc.platform !== 'ctyun') { jsonResponse(res, { error: '此接口仅支持天翼云账号' }, 400); return; }
       const client = getClient(acc);
       client.resumeFromWebUser();
       jsonResponse(res, { success: true, resumed: true });
@@ -5973,6 +6034,7 @@ function rewardNeedsDesktop(prodId, prodType) {
     }
 
     for (const acc of allowedAccounts) {
+      if (acc.platform && acc.platform !== 'ctyun') continue;
       try {
         const client = getClient(acc);
         const list = await client.getRewards();
@@ -6018,6 +6080,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       jsonResponse(res, { error: '权限不足：无权查看该云电脑设备' }, 403);
       return;
     }
+    if (acc.platform && acc.platform !== 'ctyun') { jsonResponse(res, { error: '此接口仅支持天翼云账号' }, 400); return; }
 
     const client = getClient(acc);
     try {
@@ -6055,6 +6118,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       return;
     }
 
+    if (acc.platform && acc.platform !== 'ctyun') { jsonResponse(res, { error: '此接口仅支持天翼云账号' }, 400); return; }
     const client = getClient(acc);
     try {
       // 确保已登录并拿到天翼云认证凭据
@@ -6138,6 +6202,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       return;
     }
 
+    if (acc.platform && acc.platform !== 'ctyun') { jsonResponse(res, { error: '此接口仅支持天翼云账号' }, 400); return; }
     const body = await parseJsonBody(req);
     const prodId = parseInt(body.prodId);
     const prodName = body.prodName || '商品';
@@ -6303,7 +6368,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       return;
     }
 
-    const body = await parseJsonBody(req).catch(() => ({}));
+    const body = await parseJsonBody(req);
     const client = getClient(acc);
     try {
       const actionLower = (action || '').toLowerCase();
@@ -6361,17 +6426,30 @@ function rewardNeedsDesktop(prodId, prodType) {
 
       const resPower = await client.controlPower(desktopId, action);
       if (resPower.success) {
+        const knownDesktops = client.desktopsCache?.length ? client.desktopsCache : (acc.desktops || []);
+        const desktop = knownDesktops.find(d => String(d.objId ?? d.desktopId) === String(desktopId));
+        const savedDesktop = acc.desktops?.find(d => String(d.objId ?? d.desktopId) === String(desktopId));
         // 核心联动：如果是用户在电源管理主动关机，自动关闭保活开关并打上主动关机标记
         if (actionLower === 'shutdown' || actionLower === 'poweroff') {
-          acc.features = acc.features || {};
-          acc.features.keepAlive = false;
-          acc.manualShutdown = true;
-          acc.stats = acc.stats || {};
-          acc.stats.keepAliveStatus = 'offline';
+          if (desktop) desktop.keepaliveEnabled = false;
+          if (savedDesktop) savedDesktop.keepaliveEnabled = false;
+          const allDesktopsClosed = knownDesktops.length === 0 || knownDesktops.every(d =>
+            d.keepaliveEnabled === false || d.useStatusText === '已关机' || d.useStatusText === '关机');
+          if (allDesktopsClosed) {
+            acc.features = acc.features || {};
+            acc.features.keepAlive = false;
+            acc.manualShutdown = true;
+            acc.stats = acc.stats || {};
+            acc.stats.keepAliveStatus = 'offline';
+            client.stopKeepAliveWorker();
+            appendLog('System', `[${acc.name}] 用户主动关机，已暂停账号保活守护。`, 'info');
+          } else {
+            appendLog('System', `[${acc.name}] 已关闭该台桌面的守护，其他桌面保持原有设置。`, 'info');
+          }
           saveConfig(appConfig);
-          client.stopKeepAliveWorker();
-          appendLog('System', `[${acc.name}] 用户主动关机，已自动关闭保活开关，机器将维持关机。`, 'info');
         } else if (actionLower === 'poweron' || actionLower === 'start' || actionLower === 'awake') {
+          if (desktop) desktop.keepaliveEnabled = true;
+          if (savedDesktop) savedDesktop.keepaliveEnabled = true;
           acc.features = acc.features || {};
           acc.features.keepAlive = true;
           acc.manualShutdown = false;
@@ -6498,6 +6576,8 @@ function rewardNeedsDesktop(prodId, prodType) {
     // 联动热更新：更新正在运行中所有云电脑客户端的保活重连周期并即时重设倒计时
     const newKeepSeconds = appConfig.settings.keepAliveSeconds || 60;
     for (const [id, client] of clientInstances.entries()) {
+      const acc = appConfig.accounts.find(a => a.id === id);
+      if (!acc || (acc.platform && acc.platform !== 'ctyun')) continue;
       if (client.resetCycleTimeout) {
         client.resetCycleTimeout(newKeepSeconds);
       } else {
@@ -6736,32 +6816,15 @@ function rewardNeedsDesktop(prodId, prodType) {
     const targetOwnerId = session.userId;
     const currentUser = authManager.getUserById(targetOwnerId);
 
-    // 配额计算
-    if (currentUser && currentUser.role !== 'admin') {
-      const currentOwned = mode === 'overwrite' ? 0 : appConfig.accounts.filter(a => a.ownerId === targetOwnerId).length;
-      if (currentOwned + importAccounts.length > (currentUser.maxQuota || 2)) {
-        jsonResponse(res, {
-          error: `导入失败：导入后账号数量 (${currentOwned + importAccounts.length}) 超出允许配额上限 (${currentUser.maxQuota}台)！`
-        }, 400);
+    if (session.role === 'admin' && body.settings && typeof body.settings === 'object' && body.settings.notify?.webhookUrl) {
+      const notify = body.settings.notify;
+      if (!isValidWebhookTarget(notify.channel || 'webhook', String(notify.webhookUrl).trim())) {
+        jsonResponse(res, { error: '安全拦截：禁止导入内网/私有IP或格式非法的 Webhook！' }, 400);
         return;
       }
     }
 
-    if (mode === 'overwrite') {
-      // 停止并清理当前用户原有保活
-      const oldOwned = appConfig.accounts.filter(a => a.ownerId === targetOwnerId);
-      oldOwned.forEach(o => {
-        const cl = clientInstances.get(o.id);
-        if (cl) cl.stopKeepAliveWorker();
-        clientInstances.delete(o.id);
-      });
-      appConfig.accounts = appConfig.accounts.filter(a => a.ownerId !== targetOwnerId);
-    }
-
-    let importedCount = 0;
-    for (const item of importAccounts) {
-      if (!item.user) continue;
-
+    const getImportedPlatform = (item) => {
       // ── 平台归属判定 (第一优先级：显式 platform 标签绝对优先，绝不篡改) ──
       let isYdpc = false;
       let isEcloud = false;
@@ -6791,11 +6854,54 @@ function rewardNeedsDesktop(prodId, prodType) {
           isYdpc = false; // 默认天翼云
         }
       }
+      return isEcloud ? 'ecloud' : (isYdpc ? 'ydpc' : 'ctyun');
+    };
 
-      const platformStr = isEcloud ? 'ecloud' : (isYdpc ? 'ydpc' : 'ctyun');
+    // 配额计算
+    if (currentUser && currentUser.role !== 'admin') {
+      const ownedAccounts = appConfig.accounts.filter(a => a.ownerId === targetOwnerId);
+      const currentOwned = mode === 'overwrite' ? 0 : ownedAccounts.length;
+      const knownKeys = new Set((mode === 'overwrite' ? [] : ownedAccounts).map(a => JSON.stringify([a.platform || 'ctyun', a.user])));
+      let netNewCount = 0;
+      for (const item of importAccounts) {
+        if (!item?.user) continue;
+        const key = JSON.stringify([getImportedPlatform(item), item.user]);
+        if (!knownKeys.has(key)) {
+          knownKeys.add(key);
+          netNewCount++;
+        }
+      }
+      if (currentOwned + netNewCount > (currentUser.maxQuota ?? 2)) {
+        jsonResponse(res, {
+          error: `导入失败：导入后账号数量 (${currentOwned + netNewCount}) 超出允许配额上限 (${currentUser.maxQuota}台)！`
+        }, 400);
+        return;
+      }
+    }
+
+    if (mode === 'overwrite') {
+      // 停止并清理当前用户原有保活
+      const oldOwned = appConfig.accounts.filter(a => a.ownerId === targetOwnerId);
+      for (const o of oldOwned) {
+        const cl = clientInstances.get(o.id);
+        if (cl) {
+          if (typeof cl.stop === 'function') await cl.stop();
+          else cl.stopKeepAliveWorker();
+        }
+        clientInstances.delete(o.id);
+      }
+      appConfig.accounts = appConfig.accounts.filter(a => a.ownerId !== targetOwnerId);
+    }
+
+    let importedCount = 0;
+    for (const item of importAccounts) {
+      if (!item?.user) continue;
+      const platformStr = getImportedPlatform(item);
+      const isYdpc = platformStr === 'ydpc';
+      const isEcloud = platformStr === 'ecloud';
 
       // ── 天翼云登录模式判定 (authMode === 'qrcode' 或密码为空均视为扫码绑定) ──
-      const isQrAccount = !isYdpc && (item.authMode === 'qrcode' || !item.password);
+      const isQrAccount = !isYdpc && !isEcloud && (item.authMode === 'qrcode' || !item.password);
 
       // 如果是 merge，检查手机号/账号名是否已存在同平台账号
       const existing = appConfig.accounts.find(a => a.user === item.user && a.ownerId === targetOwnerId && (a.platform || 'ctyun') === platformStr);
@@ -6879,11 +6985,15 @@ function rewardNeedsDesktop(prodId, prodType) {
       const client = getClient(newAcc);
       if (isYdpc) {
         client.refreshVms().then(() => {
-          if (newAcc.enabled && newAcc.features?.keepAlive !== false) {
+          if (resolveTaskEnabled(newAcc, null, 'keepAlive').enabled) {
             client.startKeepAliveWorker();
           }
         }).catch(() => {});
-      } else if (newAcc.password && newAcc.enabled && newAcc.features?.keepAlive !== false) {
+      } else if (isEcloud) {
+        client.refreshDesktops().then(() => {
+          if (resolveTaskEnabled(newAcc, null, 'keepAlive').enabled) client.startKeepAliveWorker();
+        }).catch(() => appendLog(ECLOUD_LOG_SOURCE, `[${newAcc.name}] 导入移动公众账号同步桌面失败，未启动守护`, 'warning', newAcc.name, 'ecloud'));
+      } else if (newAcc.password && resolveTaskEnabled(newAcc, null, 'keepAlive').enabled) {
         client.startKeepAliveWorker();
       }
     }
@@ -6891,6 +7001,7 @@ function rewardNeedsDesktop(prodId, prodType) {
     // 管理员导入时若带 settings 则一并更新
     if (session.role === 'admin' && body.settings && typeof body.settings === 'object') {
       appConfig.settings = { ...appConfig.settings, ...body.settings };
+      if (taskScheduler) taskScheduler.scheduleNextRun();
       appendLog('System', `⚠️ 备份文件包含系统设置，已一并还原 (保活周期: ${appConfig.settings.keepAliveSeconds}s / 脉冲间隔: ${(appConfig.settings.pulseIntervalSeconds || (appConfig.settings.pulseIntervalMinutes || 45) * 60)}秒 / 触发时间: ${appConfig.settings.cron?.executeTime || '01:20'})。如与预期不符，请前往「系统设置」核对调整。`, 'warning');
     }
 
@@ -6921,6 +7032,16 @@ function rewardNeedsDesktop(prodId, prodType) {
   }
 
   jsonResponse(res, { error: 'Not Found' }, 404);
+  } catch (err) {
+    if (res.writableEnded || res.destroyed) return;
+    const status = err?.statusCode === 413 ? 413 : (err?.statusCode === 400 ? 400 : 500);
+    try { appendLog('HTTP', `请求处理异常 (${status})`, 'error'); } catch (e) { /* 响应兜底不依赖日志可用性 */ }
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    jsonResponse(res, { error: status === 413 ? '请求体过大（最大 2 MiB）' : (status === 400 ? '请求读取失败' : '服务器内部错误') }, status);
+  }
 });
 
 if (require.main === module) {

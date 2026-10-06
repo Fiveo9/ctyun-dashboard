@@ -60,7 +60,7 @@
 | `P1-03` | P1 | `server.js` | 修复 `refreshOfficialTasks` 40010 未重试及用积分结果掩盖任务读取失败 | `server.js` | [x] |
 | `P1-04` | P1 | `server.js` | 修复 12h 续期风暴、`stopKeepAliveWorker` 定时器泄漏与打卡倒计时误清零 | `server.js` | [x] |
 | `P1-05` | P1 | `app/tasks` | 修复 `TaskScheduler` 多平台串扰、重复触发、`NaN` 死循环与无超时下单 | `app/tasks/scheduler.js`, `app/tasks/native_tasks.js` | [x] |
-| `P1-06` | P1 | `server.js`, `auth_manager.js`, `ctyun_encryption.js` | 路由异常兜底、请求体限制、侧车进程清理、平台守卫、配额 `0` 修复 | `server.js`, `app/auth_manager.js`, `app/ctyun_encryption.js` | [ ] |
+| `P1-06` | P1 | `server.js`, `auth_manager.js`, `ctyun_encryption.js` | 路由异常兜底、请求体限制、侧车进程清理、平台守卫、配额 `0` 修复 | `server.js`, `app/auth_manager.js`, `app/ctyun_encryption.js` | [x] |
 | `P1-07` | P1 | `ydpc_client.js` | 修复 `verifyKeepAliveEffect` 必现 `ReferenceError: originCn is not defined` | `app/ydpc/ydpc_client.js` | [ ] |
 | `P1-08` | P1 | `ydpc_client.js` | 修复底座探测缓存失效、键类型不匹配、闭包陈旧 `vm`、数据面死循环与 MQTT 关闭失效 | `app/ydpc/ydpc_client.js` | [ ] |
 | `P1-09` | P1 | `cag_boot.js` | 修复 `cs_getToken` 密码双重 URL 编码与 HTTP/解密/重试边缘 Bug | `app/ydpc/cag_boot.js` | [ ] |
@@ -364,6 +364,29 @@
      - `app/auth_manager.js:245`：`const parsed = parseInt(maxQuota, 10); user.maxQuota = (Number.isFinite(parsed) && parsed >= 0) ? parsed : 2;`（允许配额设为 `0`）。
      - `app/auth_manager.js:95-99, 283-289`：`verifySession` 动态同步 `session.username = user.username;`；`updateAdminUsername` 同步后调用 `this._persistSessions();`。
      - `app/ctyun_encryption.js:8-18, 64-67`：检验 `Buffer.isBuffer(data) && data.length >= 16 + 166`（不足则抛清晰错误）及 `resultBytes.length > keyLen` 时截取尾部 `keyLen` 字节防止 `Buffer.copy` 越界异常。
+- **执行记录（2026-11-24）**：顶层路由异常泛化返回 500、已发头则结束损坏响应，Host 缺失回退 localhost；JSON Body 按 UTF-8 字节限 2 MiB，error/aborted 拒绝且超限返回 413，保留旧空/坏 JSON 的 `{}` 语义，去掉两处会吞掉超限的空 Body 兜底。账号列表统一开关默认值并避免失效/关闭时重复启停；管理员全量排序、普通用户归属隔离及重复 ID 去重保持。导入配额复用原平台推断并只计去重净新增，Webhook 在清理/写入前校验，设置还原后重挂调度；ecloud 不按空口令判天翼云扫码，先同步桌面再按统一开关启动。临时侧车失败/抛错调用 stop(true)，成功/短信移交后保留；删除/覆盖优先 await stop，退出遍历所有客户端、停止调度/关闭日志并设 2 秒兜底。五类专属路由与商品查询隔离移动平台，扫码 ID/手机号匹配均排除 ecloud，周期热更新只触达天翼云；单机关机只关闭该台守护，全部关闭/明确已关机才暂停账号，显式开机恢复该台，未知状态不当关机证据。Auth 配额 0 在管理器及添加/导入路由生效，会话同步 username、改名落盘；加密入口及超宽 RSA 结果边界修复。新增 21 项 P1-06 离线回归、43 项变异（M219–M261），先复现 257 通过/21 失败（exit=1）；修复期间四项夹具缺依赖/误抽取已补真实依赖与声明锚点，原隐私断言未删改。交付源码已做范围内只读 review；最终阶段结果见下。
+
+### Phase 2 阶段验收（2026-11-24，Windows 离线）
+
+- 本阶段 P1-01～P1-06 全部完成；共新增 45 项回归、90 项变异（M172–M261），原 204 项结构/行为锁保留。
+- 首轮全量变异发现旧 M19 漏网；它仍能制造启动补跑跨平台错误，新增一项“混合平台且天翼云已完成”的行为回归闭环。未修改 M19 的目标或生产隔离逻辑来迎合测试；随后正式全量从头重跑。
+
+| 实际 npm 验证 | 最终结果 | 退出码 |
+| :--- | :--- | :--- |
+| `npm test` | JS 语法 18/18；回归 279 通过、0 失败 | 0 |
+| `npm run test:mutation` | 261 个不同变异全部捕获；FAIL/BROKEN/SKIP 均 0；最终原仓库基线 279/0、有真实汇总行 | 0 |
+
+实际执行入口（调用原 npm 脚本，`package.json` 未改）：
+
+```powershell
+pwsh -NoProfile -File backups/phase2-20261124.tmp/runtime/run-tests.ps1 -Task test -LogName phase2-final-test.log
+pwsh -NoProfile -File backups/phase2-20261124.tmp/runtime/run-tests.ps1 -Task mutation -LogName mutation-phase2-final.log
+```
+
+- 最终证据：`backups/phase2-20261124.tmp/evidence/phase2-final-test.log`、`backups/phase2-20261124.tmp/evidence/mutation-phase2-final.log`；18 份逐项复现/通过及诊断日志均保留。修改前源码备份仍在该任务备份目录的 P1-01～P1-06 等子目录。
+- 安全执行：Node/Python 测试清理由任务隔离运行器改为可恢复移动；正式变异额外排除备份、凭据文件名及链接。临时单项 `node -e` 诊断未触发这层附加复制过滤（原有 data/node_modules 等排除仍在），不作为最终全量资格依据；弃用该入口后由受保护 npm 入口重跑，相关副本亦已回收，未查看/输出凭据值或上传副本。
+- 回收：审查运行时 57,603 项、遗留沙箱 2,161 项，链接均为 0；移动至 `backups/phase2-20261124.tmp/recycle-bin/runtime/` 与 `backups/phase2-20261124.tmp/recycle-bin/ctyun-mutation-2404/`，无物理删除。上列历史入口中的运行器现已随工具链回收；如需复用，只取工具链/运行器，不还原旧源码或侧车会话。
+- 资格限制：本机 Windows、已有 Python 3.12 及侧车依赖的离线结构/行为验证；未使用真实云账号、Broker、手机扫码、真实通知或积分下单，未执行 Linux/Docker/设备资格验证。未改 Python 源码；未进入 Phase 3～6。
 
 ---
 

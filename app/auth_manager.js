@@ -113,10 +113,11 @@ class AuthManager {
       this._persistSessions(); // 过期即清盘（否则磁盘会堆积死会话）
       return null;
     }
-    // 动态同步最新用户的 maxQuota、role 和 avatar；
+    // 动态同步最新用户的 username、maxQuota、role 和 avatar；
     // 用户已被删除 ⇒ 会话必须失效（否则残留会话还能以旧身份访问）。
     const user = this.getUserById(session.userId);
     if (user) {
+      session.username = user.username;
       session.role = user.role;
       session.maxQuota = user.maxQuota;
       session.avatar = user.avatar || '';
@@ -272,7 +273,8 @@ class AuthManager {
     const cfg = this.configManager.config;
     const user = (cfg.users || []).find(u => u.id === userId);
     if (!user) return false;
-    user.maxQuota = parseInt(maxQuota) || 2;
+    const parsed = parseInt(maxQuota, 10);
+    user.maxQuota = (Number.isFinite(parsed) && parsed >= 0) ? parsed : 2;
     this.configManager.saveConfig();
     return true;
   }
@@ -334,6 +336,7 @@ class AuthManager {
     for (const [token, s] of this.sessions.entries()) {
       if (s.userId === admin.id) s.username = cleanNew;
     }
+    this._persistSessions();
     this.configManager.saveConfig();
     return { success: true, newUsername: cleanNew };
   }

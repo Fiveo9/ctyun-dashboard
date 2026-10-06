@@ -1315,6 +1315,8 @@ class CtYunClient {
     this.webUserActiveUntil = 0;
     this.externalYieldUntil = 0; // 官方客户端抢占避让截止时间戳
     this.lastTokenRenewAt = Date.now();
+    this._renewingToken = false;
+    this._tokenRenewRetryAt = 0;
     this.isTaskHanging = false; // 是否正在执行 Scheduler 精准调度的 1 小时挂机任务
     this.hangRetryTimer = null; // 挂机任务自动重试定时器 (未达标自愈续跑)
     this.hangRetryCount = 0;    // 当日挂机重试次数 (上限 24 次)
@@ -2492,8 +2494,21 @@ class CtYunClient {
 
   stopKeepAliveWorker() {
     this.workerRunning = false;
-    if (this.loopTimer) clearTimeout(this.loopTimer);
-    if (this.countdownTimer) clearInterval(this.countdownTimer);
+    if (this.endCurrentSession) this.endCurrentSession('Worker Stopped');
+    if (this.loopTimer) {
+      clearTimeout(this.loopTimer);
+      this.loopTimer = null;
+    }
+    if (this.countdownTimer) {
+      clearInterval(this.countdownTimer);
+      this.countdownTimer = null;
+    }
+    if (this.clinkPingTimer) {
+      clearInterval(this.clinkPingTimer);
+      this.clinkPingTimer = null;
+    }
+    this.clearHangRetry();
+    this.clearSignVerify();
     if (this.ws) {
       try { this.ws.close(); } catch (e) {}
     }
@@ -2552,6 +2567,8 @@ class CtYunClient {
       let isClosingSelf = false;
       let sessionTimeout = null;
       let hangCheckInterval = null;
+      let initTimer = null;
+      let goalInitTimer = null;
       let wsConnectedAt = 0;
       let goalAchieved = false; // 目标任务 (如登录AI云电脑) 是否已获得官方确认
       let clientPresenceSignal = false; // 官方客户端在席信令 (Type 119/120/137)：收到即代表真机用户接入
@@ -2566,7 +2583,12 @@ class CtYunClient {
         isClosingSelf = true;
         this.endCurrentSession = null;
         if (sessionTimeout) clearTimeout(sessionTimeout);
-        if (this.countdownTimer) clearInterval(this.countdownTimer);
+        if (initTimer) clearTimeout(initTimer);
+        if (goalInitTimer) clearTimeout(goalInitTimer);
+        if (this.countdownTimer) {
+          clearInterval(this.countdownTimer);
+          this.countdownTimer = null;
+        }
         if (this.clinkPingTimer) {
           clearInterval(this.clinkPingTimer);
           this.clinkPingTimer = null;
@@ -2629,6 +2651,7 @@ class CtYunClient {
       });
 
       const safeSend = (data) => {
+        if (cycleDone) return;
         try {
           if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             this.ws.send(data);
@@ -2639,6 +2662,7 @@ class CtYunClient {
       };
 
       this.ws.on('open', () => {
+        if (cycleDone) return;
         wsConnectedAt = Date.now();
         this.sessionConflictStreak = 0;
         this.conflictRetryUntil = 0;
@@ -2674,7 +2698,8 @@ class CtYunClient {
         };
         safeSend(JSON.stringify(connectMsg));
 
-        setTimeout(() => {
+        initTimer = setTimeout(() => {
+          if (cycleDone) return;
           const initBuf = Buffer.from('UkVEUQIAAAACAAAAGgAAAAAAAAABAAEAAAABAAAAEgAAAAkAAAAECAAA', 'base64');
           safeSend(initBuf);
           appendLog('Heartbeat', `[${accName}][${desktopName}] 已发送保活特征码报文 (UkVEUQIA...)`, 'info');
@@ -2682,6 +2707,7 @@ class CtYunClient {
       });
 
       this.ws.on('message', (data) => {
+        if (cycleDone) return;
         try {
           const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
           const hex = buf.toString('hex').toUpperCase();
@@ -2751,6 +2777,10 @@ class CtYunClient {
 
               if (isHangMode) {
                 try {
+                  const numDesktopId = Number(desktopId);
+                  if (!Number.isInteger(numDesktopId) || numDesktopId < 0 || numDesktopId > 0xffffffff) {
+                    throw new Error('桌面 ID 必须为 uint32 整数');
+                  }
                   const sId = desktopInfo.token || '';
                   const dType = this.deviceType ? String(this.deviceType) : '';
                   const dCode = this.account.deviceCode || '';
@@ -2766,7 +2796,7 @@ class CtYunClient {
                   let offset = 0;
                   let strOffset = 36;
 
-                  dataBuf.writeUInt32LE(Number(desktopId), offset); offset += 4;
+                  dataBuf.writeUInt32LE(numDesktopId, offset); offset += 4;
                   dataBuf.writeUInt32LE(sIdLen, offset); offset += 4;
                   dataBuf.writeUInt32LE(strOffset, offset); offset += 4; strOffset += sIdLen;
                   dataBuf.writeUInt32LE(dTypeLen, offset); offset += 4;
@@ -2787,7 +2817,9 @@ class CtYunClient {
                   dataBuf.copy(msgBuf112, 6);
 
                   safeSend(msgBuf112);
-                } catch (e) {}
+                } catch (e) {
+                  appendLog('Heartbeat', `[${accName}][${desktopName}] 112 认领报文构造失败: ${e.message}`, 'warning');
+                }
 
                 try {
                   const msgBuf104 = Buffer.alloc(6);
@@ -2813,41 +2845,49 @@ class CtYunClient {
               if (isHangMode || goalTaskName) {
                 const watchTaskName = goalTaskName || '使用1小时';
                 const isGoalHang = !goalTaskName; // 未指定目标 = 经典挂机 (1 小时)
+                let checkingGoal = false;
                 const checkGoalProgress = async () => {
-                  if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-                  await this.refreshOfficialTasks();
-                  const goalTask = this.metrics.officialTasks?.find(t => t.name.includes(watchTaskName));
-                  const curSec = goalTask ? (goalTask.current || 0) : 0;
-                  const totSec = goalTask ? (goalTask.total || 3600) : 3600;
+                  if (cycleDone || checkingGoal || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+                  checkingGoal = true;
+                  try {
+                    const taskRead = await this.refreshOfficialTasks();
+                    if (cycleDone || !taskRead?.ok) return;
+                    const goalTask = this.metrics.officialTasks?.find(t => t.name.includes(watchTaskName));
+                    const curSec = goalTask ? (goalTask.current || 0) : 0;
+                    const totSec = goalTask ? (goalTask.total || 3600) : 3600;
 
-                  if (goalTask && (goalTask.status === 2 || (totSec > 0 && curSec >= totSec))) {
-                    if (hangCheckInterval) clearInterval(hangCheckInterval);
-                    if (isGoalHang) {
-                      appendLog('KeepAlive', `[${accName}][${desktopName}] 🎉 恭喜！今日使用 AI 云电脑 1 小时挂机任务已圆满达成 (+100积分)！后台长连接立即主动让位关闭，转入脉冲保活防休眠模式。`, 'success');
-                      sendAccountNotification(
-                        this.account,
-                        `🎉 挂机1小时任务达成 - ${accName}`,
-                        `账号【${accName}】今日使用 AI 云电脑达到 1 小时任务已完成，100 积分已入账！`
-                      );
-                      endSession('Today Hang Goal Achieved');
+                    if (goalTask && (goalTask.status === 2 || (totSec > 0 && curSec >= totSec))) {
+                      if (hangCheckInterval) clearInterval(hangCheckInterval);
+                      if (isGoalHang) {
+                        appendLog('KeepAlive', `[${accName}][${desktopName}] 🎉 恭喜！今日使用 AI 云电脑 1 小时挂机任务已圆满达成 (+100积分)！后台长连接立即主动让位关闭，转入脉冲保活防休眠模式。`, 'success');
+                        sendAccountNotification(
+                          this.account,
+                          `🎉 挂机1小时任务达成 - ${accName}`,
+                          `账号【${accName}】今日使用 AI 云电脑达到 1 小时任务已完成，100 积分已入账！`
+                        );
+                        endSession('Today Hang Goal Achieved');
+                      } else {
+                        goalAchieved = true;
+                        appendLog('Sign', `[${accName}][${desktopName}] 🎉 官方任务中心已实时确认【${watchTaskName}】达成 (+100积分)！登录打卡已真实完成！`, 'success');
+                        endSession('Sign Goal Achieved');
+                      }
+                    } else if (isGoalHang) {
+                      const curMin = Math.floor(curSec / 60);
+                      const totMin = Math.floor(totSec / 60);
+                      const remainSec = Math.max(0, totSec - curSec);
+                      this.metrics.lastHeartbeatResult = `[${desktopName}] 挂机累加中: 已在线 ${curMin}/${totMin} 分钟 (${curSec}/${totSec}秒，剩余约 ${Math.ceil(remainSec / 60)} 分钟)`;
+                      this.metrics.cycleCountdown = remainSec;
                     } else {
-                      goalAchieved = true;
-                      appendLog('Sign', `[${accName}][${desktopName}] 🎉 官方任务中心已实时确认【${watchTaskName}】达成 (+100积分)！登录打卡已真实完成！`, 'success');
-                      endSession('Sign Goal Achieved');
+                      this.metrics.lastHeartbeatResult = `[${desktopName}] 桌面登录认领保持中，等待官方任务中心确认【${watchTaskName}】...`;
                     }
-                  } else if (isGoalHang) {
-                    const curMin = Math.floor(curSec / 60);
-                    const totMin = Math.floor(totSec / 60);
-                    const remainSec = Math.max(0, totSec - curSec);
-                    this.metrics.lastHeartbeatResult = `[${desktopName}] 挂机累加中: 已在线 ${curMin}/${totMin} 分钟 (${curSec}/${totSec}秒，剩余约 ${Math.ceil(remainSec / 60)} 分钟)`;
-                    this.metrics.cycleCountdown = remainSec;
-                  } else {
-                    this.metrics.lastHeartbeatResult = `[${desktopName}] 桌面登录认领保持中，等待官方任务中心确认【${watchTaskName}】...`;
-                    this.metrics.cycleCountdown = Math.max(0, Math.round((totSec - curSec) / 1000));
+                  } catch (e) {
+                    appendLog('Heartbeat', `[${accName}][${desktopName}] 目标任务进度查询失败: ${e.message}`, 'warning');
+                  } finally {
+                    checkingGoal = false;
                   }
                 };
 
-                setTimeout(checkGoalProgress, 2500);
+                goalInitTimer = setTimeout(checkGoalProgress, 2500);
                 hangCheckInterval = setInterval(checkGoalProgress, 15000);
               } else {
                 this.metrics.lastHeartbeatResult = `[${desktopName}] 脉冲保活握手就绪，已向网关发送 REDQ/心跳`;
@@ -2867,6 +2907,7 @@ class CtYunClient {
       });
 
       this.ws.on('error', (err) => {
+        if (cycleDone) return;
         appendLog('Heartbeat', `[${accName}][${desktopName}] 通道异常: ${err.message || '连接受阻'}`, 'error');
         this.metrics.errorCount++;
         endSession('Socket Error');
@@ -3221,10 +3262,19 @@ class CtYunClient {
         }
 
         // 定期主动无感续期 (每 12 小时静默轮转刷新一次 Token 凭据，确保持久常驻不失效)
-        if (!this.lastTokenRenewAt || (Date.now() - this.lastTokenRenewAt > 12 * 3600 * 1000)) {
-          this.renewToken().then(() => {
+        if ((!this.lastTokenRenewAt || (Date.now() - this.lastTokenRenewAt > 12 * 3600 * 1000)) &&
+            !this._renewingToken && Date.now() >= this._tokenRenewRetryAt) {
+          this._renewingToken = true;
+          this.renewToken().then((newInfo) => {
+            if (!newInfo) throw new Error('续期未返回有效会话');
             this.lastTokenRenewAt = Date.now();
-          }).catch(() => {});
+            this._tokenRenewRetryAt = 0;
+          }).catch((e) => {
+            this._tokenRenewRetryAt = Date.now() + 15 * 60 * 1000;
+            appendLog('KeepAlive', `[${accName}] 自动续期失败，15 分钟后重试: ${e.message}`, 'warning');
+          }).finally(() => {
+            this._renewingToken = false;
+          });
         }
 
         // 1. 查询名下全部云电脑

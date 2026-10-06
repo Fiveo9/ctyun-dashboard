@@ -6493,6 +6493,262 @@ testAsync('P1-03：任务列表成功不被积分失败否定，空任务列表�
   assert.strictEqual(noLogin.requests.length, 0);
 });
 
+function phase2Deferred() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+async function phase2Flush() {
+  for (let i = 0; i < 12; i++) await Promise.resolve();
+}
+
+function phase2FakeClock(initialNow = 13 * 3600 * 1000) {
+  let now = initialNow;
+  let nextId = 1;
+  const timers = new Map();
+  const add = (fn, ms, interval) => {
+    const id = nextId++;
+    timers.set(id, { fn, ms, interval });
+    return id;
+  };
+  return {
+    timers, get now() { return now; }, advance(ms) { now += ms; },
+    find(ms, interval = false) { return [...timers].find(([, t]) => t.ms === ms && t.interval === interval)?.[0]; },
+    fire(id) {
+      assert.ok(timers.has(id), '虚拟计时器必须仍有效');
+      const timer = timers.get(id);
+      if (!timer.interval) timers.delete(id);
+      return timer.fn();
+    },
+    globals: {
+      Date: class extends Date { static now() { return now; } },
+      setTimeout: (fn, ms) => add(fn, ms, false), clearTimeout: id => timers.delete(id),
+      setInterval: (fn, ms) => add(fn, ms, true), clearInterval: id => timers.delete(id),
+    },
+  };
+}
+
+function phase2RenewalHarness() {
+  const clock = phase2FakeClock();
+  const renewals = [], warnings = [];
+  const api = phase2CtYunMethods(['async runCycleLoop()'], {
+    ...clock.globals, appendLog: (...args) => warnings.push(args),
+  });
+  const client = {
+    account: { name: 'fixture-renewal', stats: {} }, loginInfo: { fixture: true }, metrics: {},
+    workerRunning: true, lastTokenRenewAt: 1, _renewingToken: false, _tokenRenewRetryAt: 0,
+    resolveTask: () => ({ enabled: true }), getDesktops: async () => [],
+    renewToken: () => { const pending = phase2Deferred(); renewals.push(pending); return pending.promise; },
+  };
+  const running = api.runCycleLoop.call(client);
+  return { clock, client, renewals, warnings, async stop() {
+    client.workerRunning = false;
+    for (const pending of renewals) pending.resolve({ fixture: true });
+    await phase2Flush();
+    const sleep = clock.find(60000);
+    if (sleep) clock.fire(sleep);
+    await running;
+  } };
+}
+
+function phase2SessionHarness({ desktopId = 42, isHangMode = true, goalTaskName = '登录AI云电脑', refresh } = {}) {
+  const EventEmitter = require('events');
+  const clock = phase2FakeClock();
+  const warnings = [], sent = [], notifications = [];
+  let refreshCalls = 0, session;
+  class FakeWebSocket extends EventEmitter {
+    static OPEN = 1;
+    constructor() { super(); this.readyState = 0; }
+    send(data) { sent.push(data); }
+    open() { this.readyState = 1; this.emit('open'); }
+    close() { if (this.readyState === 3) return; this.readyState = 3; this.emit('close', 1000, 'fixture close'); }
+  }
+  const api = phase2CtYunMethods(['async runDesktopKeepAliveSession(desktop, isHangMode = false, pulseConnectSec = 20, goalTaskName = \'\')'], {
+    ...clock.globals, WebSocket: FakeWebSocket, saveConfig() {},
+    getBeijingDateOnly: () => '2026-11-24', getBeijingTimeOnly: () => '12:00:00',
+    appendLog: (...args) => warnings.push(args), sendAccountNotification: (...args) => notifications.push(args),
+  });
+  const client = {
+    account: { name: 'fixture-session', stats: {} },
+    loginInfo: { userName: 'fixture-session', userId: 'fixture-id' },
+    metrics: { successCount: 0, errorCount: 0, officialTasks: [{ name: '登录AI云电脑', current: 0, total: 1 }] },
+    connect: async () => ({ clinkLvsOutHost: 'gateway.example:443', host: 'desktop.example', port: 443 }),
+    refreshOfficialTasks: async () => { refreshCalls++; return refresh ? refresh(client, refreshCalls) : { ok: true }; },
+    encryptor: { execute: () => Buffer.alloc(6) },
+  };
+  return { clock, client, warnings, sent, notifications, get refreshCalls() { return refreshCalls; },
+    get session() { return session; }, async start() {
+      session = api.runDesktopKeepAliveSession.call(client, { objId: desktopId, desktopId, objName: 'fixture-desktop' }, isHangMode, 300, goalTaskName);
+      await phase2Flush();
+      assert.ok(client.ws, '离线会话必须已创建 WebSocket');
+      client.ws.open();
+      const auth = Buffer.alloc(6);
+      auth.writeUInt16LE(103, 0);
+      client.ws.emit('message', auth);
+    }, async end() { if (client.endCurrentSession) client.endCurrentSession('fixture stop'); return session; },
+  };
+}
+
+testAsync('P1-04：12 小时续期 pending 期间只发一次，成功更新时间并释放锁', async () => {
+  const h = phase2RenewalHarness();
+  try {
+    await phase2Flush();
+    h.clock.advance(60000);
+    h.clock.fire(h.clock.find(60000));
+    await phase2Flush();
+    assert.strictEqual(h.renewals.length, 1, '慢续期期间不得并发重发');
+    assert.strictEqual(h.client._renewingToken, true);
+    h.renewals[0].resolve({ fixture: true });
+    await phase2Flush();
+    assert.strictEqual(h.client.lastTokenRenewAt, h.clock.now);
+    assert.strictEqual(h.client._renewingToken, false);
+    h.clock.fire(h.clock.find(60000));
+    await phase2Flush();
+    assert.strictEqual(h.renewals.length, 1, '成功后 12 小时窗口内不得再发');
+    assert.match(server, /this\.lastTokenRenewAt = Date\.now\(\);\s*this\._renewingToken = false;\s*this\._tokenRenewRetryAt = 0;/);
+  } finally { await h.stop(); }
+});
+
+testAsync('P1-04：续期拒绝或返回空值都 warning 并退避 15 分钟，窗口后允许重试', async () => {
+  for (const failure of ['reject', 'false']) {
+    const h = phase2RenewalHarness();
+    try {
+      await phase2Flush();
+      if (failure === 'reject') h.renewals[0].reject(new Error('fixture renewal failure'));
+      else h.renewals[0].resolve(false);
+      await phase2Flush();
+      assert.strictEqual(h.client.lastTokenRenewAt, 1, '失败不能记为成功续期');
+      assert.strictEqual(h.client._tokenRenewRetryAt, h.clock.now + 15 * 60 * 1000);
+      assert.strictEqual(h.client._renewingToken, false);
+      assert.ok(h.warnings.some(x => x[2] === 'warning' && /续期/.test(x[1])), '续期失败必须留证');
+      h.clock.advance(60000);
+      h.clock.fire(h.clock.find(60000));
+      await phase2Flush();
+      assert.strictEqual(h.renewals.length, 1, '退避窗口内不能重发');
+      h.clock.advance(14 * 60000);
+      h.clock.fire(h.clock.find(60000));
+      await phase2Flush();
+      assert.strictEqual(h.renewals.length, 2, '退避到期应允许一次重试');
+      h.renewals[1].resolve({ fixture: true });
+      await phase2Flush();
+      assert.strictEqual(h.client._renewingToken, false);
+      assert.strictEqual(h.client.lastTokenRenewAt, h.clock.now);
+    } finally { await h.stop(); }
+  }
+});
+
+test('P1-04：停止 Worker 结束当前会话并清理全部五类计时器，可重复停止', () => {
+  const clock = phase2FakeClock(), ended = [];
+  const api = phase2CtYunMethods(['stopKeepAliveWorker()', 'clearHangRetry()', 'clearSignVerify()'], clock.globals);
+  const client = Object.assign({ workerRunning: true, wsAlive: true, metrics: { status: 'online' },
+    loopTimer: clock.globals.setTimeout(() => {}, 10), countdownTimer: clock.globals.setInterval(() => {}, 1000),
+    clinkPingTimer: clock.globals.setInterval(() => {}, 5000), hangRetryTimer: clock.globals.setTimeout(() => {}, 20),
+    signVerifyTimer: clock.globals.setTimeout(() => {}, 30), hangRetryCount: 2, signVerifyRound: 2,
+    endCurrentSession(reason) { ended.push(reason); this.endCurrentSession = null; }, ws: { close() {} },
+  }, api);
+  client.stopKeepAliveWorker();
+  assert.deepStrictEqual(ended, ['Worker Stopped']);
+  assert.strictEqual(clock.timers.size, 0, '停止后不允许遗留计时器');
+  for (const field of ['loopTimer', 'countdownTimer', 'clinkPingTimer', 'hangRetryTimer', 'signVerifyTimer']) assert.strictEqual(client[field], null);
+  assert.strictEqual(client.workerRunning, false);
+  assert.strictEqual(client.wsAlive, false);
+  assert.strictEqual(client.metrics.status, 'offline');
+  client.stopKeepAliveWorker();
+  assert.strictEqual(clock.timers.size, 0);
+});
+
+testAsync('P1-04：脉冲和打卡会话结束取消初始化/观察及心跳计时器，已排队回调不再发送', async () => {
+  for (const sample of [{ isHangMode: false, goalTaskName: '' }, { isHangMode: true, goalTaskName: '登录AI云电脑' }]) {
+    const h = phase2SessionHarness(sample);
+    try {
+      await h.start();
+      const lateInit = h.clock.timers.get(h.clock.find(500)).fn;
+      const lateGoal = h.clock.timers.get(h.clock.find(2500))?.fn;
+      if (sample.goalTaskName) assert.ok(lateGoal, '打卡会话必须安排初始进度观察');
+      const result = await h.end();
+      assert.strictEqual(result.goalAchieved, false);
+      assert.strictEqual(h.clock.timers.size, 0, '结束后必须取消 500ms/2500ms 初始化及所有会话计时器');
+      const sentBefore = h.sent.length;
+      lateInit();
+      if (lateGoal) await lateGoal();
+      assert.strictEqual(h.sent.length, sentBefore, '已结束回调不能发送报文');
+      assert.strictEqual(h.refreshCalls, 0, '已结束回调不能重新查询任务');
+    } finally { await h.end(); }
+  }
+});
+
+testAsync('P1-04：任务观察不重入，异常留证并解锁，异步查询结束后不再假报达成', async () => {
+  const pending = phase2Deferred();
+  const h = phase2SessionHarness({ refresh: (_, calls) => calls === 1 ? pending.promise : { ok: true } });
+  let first;
+  try {
+    await h.start();
+    first = h.clock.fire(h.clock.find(2500));
+    await h.clock.fire(h.clock.find(15000, true));
+    assert.strictEqual(h.refreshCalls, 1, '慢任务查询不能重入');
+    pending.reject(new Error('fixture progress failure'));
+    await assert.doesNotReject(first, '任务观察异常不得形成未处理拒绝');
+    assert.ok(h.warnings.some(x => x[2] === 'warning' && /任务.*进度/.test(x[1])), '任务观察异常必须留证');
+    await h.clock.fire(h.clock.find(15000, true));
+    assert.strictEqual(h.refreshCalls, 2, '异常后 finally 必须释放观察锁');
+  } finally { pending.resolve({ ok: false }); if (first) await first.catch(() => {}); await h.end(); }
+
+  const delayed = phase2Deferred();
+  const stopped = phase2SessionHarness({ refresh: () => delayed.promise });
+  let late;
+  try {
+    await stopped.start();
+    late = stopped.clock.fire(stopped.clock.find(2500));
+    await stopped.end();
+    stopped.client.metrics.officialTasks = [{ name: '登录AI云电脑', status: 2, current: 1, total: 1 }];
+    delayed.resolve({ ok: true });
+    await late;
+    assert.ok(!stopped.warnings.some(x => x[2] === 'success' && /实时确认/.test(x[1])), '结束前开始的查询不能在结束后假报完成');
+  } finally { delayed.resolve({ ok: false }); if (late) await late.catch(() => {}); await stopped.end(); }
+});
+
+testAsync('P1-04：打卡保留观察倒计时，失败读取不采用旧完成快照，成功读取仍可确认', async () => {
+  for (const sample of [{ ok: true, status: 0 }, { ok: false, status: 2 }, { ok: true, status: 2 }]) {
+    const h = phase2SessionHarness({ refresh: () => ({ ok: sample.ok }) });
+    try {
+      await h.start();
+      h.client.metrics.officialTasks = [{ name: '登录AI云电脑', current: sample.status === 2 ? 1 : 0, total: 1, status: sample.status }];
+      h.clock.fire(h.clock.find(1000, true));
+      const countdown = h.client.metrics.cycleCountdown;
+      await h.clock.fire(h.clock.find(2500));
+      if (sample.ok && sample.status === 2) {
+        assert.strictEqual((await h.session).goalAchieved, true);
+      } else {
+        assert.strictEqual(h.client.metrics.cycleCountdown, countdown, '打卡倒计时不能用任务计数/1000 归零');
+        assert.strictEqual(typeof h.client.endCurrentSession, 'function', '失败读取不能使用旧完成快照结束会话');
+        assert.strictEqual((await h.end()).goalAchieved, false);
+      }
+    } finally { await h.end(); }
+  }
+  const hang = phase2SessionHarness({ goalTaskName: '' });
+  try {
+    await hang.start();
+    hang.client.metrics.officialTasks = [{ name: '使用1小时', current: 60, total: 3600, status: 0 }];
+    await hang.clock.fire(hang.clock.find(2500));
+    assert.strictEqual(hang.client.metrics.cycleCountdown, 3540, '挂机仍使用秒数剩余进度');
+  } finally { await hang.end(); }
+});
+
+testAsync('P1-04：112 桌面 ID 接受 uint32 边界，非法范围/小数不发送并 warning', async () => {
+  for (const desktopId of [0, 0xffffffff, '42', -1, 0x100000000, 1.5, NaN, Infinity, 'invalid-id']) {
+    const h = phase2SessionHarness({ desktopId });
+    try {
+      await h.start();
+      const packets = h.sent.filter(x => Buffer.isBuffer(x) && x.readUInt16LE(0) === 112);
+      const valid = Number.isInteger(Number(desktopId)) && Number(desktopId) >= 0 && Number(desktopId) <= 0xffffffff;
+      assert.strictEqual(packets.length, valid ? 1 : 0, '非法 uint32 ID 不允许发送 112');
+      if (valid) assert.strictEqual(packets[0].readUInt32LE(6), Number(desktopId));
+      else assert.ok(h.warnings.some(x => x[2] === 'warning' && /112/.test(x[1])), '112 构造失败不得静默吞掉');
+    } finally { await h.end(); }
+  }
+});
+
 // ============================================================================
 // 汇总输出（先跑完全部异步断言，再统一出结果）
 // ============================================================================

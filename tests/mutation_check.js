@@ -1681,6 +1681,85 @@ const MUTATIONS = [
     from: '    let tasksOk = false;',
     to: '    let tasksOk = true;',
   },
+  {
+    id: 'M182', name: 'P1-04：pending 续期不再互斥', file: 'server.js',
+    from: '!this._renewingToken && Date.now() >= this._tokenRenewRetryAt',
+    to: 'Date.now() >= this._tokenRenewRetryAt',
+  },
+  {
+    id: 'M183', name: 'P1-04：失败续期退避闸门被移除', file: 'server.js',
+    from: '!this._renewingToken && Date.now() >= this._tokenRenewRetryAt',
+    to: '!this._renewingToken',
+  },
+  {
+    id: 'M184', name: 'P1-04：续期 finally 不再解锁', file: 'server.js',
+    from: '          }).finally(() => {\n            this._renewingToken = false;',
+    to: '          }).finally(() => {\n            this._renewingToken = true;',
+  },
+  {
+    id: 'M185', name: 'P1-04：失败续期退避缩短为一分钟', file: 'server.js',
+    from: 'this._tokenRenewRetryAt = Date.now() + 15 * 60 * 1000;',
+    to: 'this._tokenRenewRetryAt = Date.now() + 60 * 1000;',
+  },
+  {
+    id: 'M186', name: 'P1-04：停止 Worker 不再结束会话', file: 'server.js',
+    from: "    if (this.endCurrentSession) this.endCurrentSession('Worker Stopped');",
+    to: '',
+  },
+  {
+    id: 'M187', name: 'P1-04：停止 Worker 不再清理 clink 心跳', file: 'server.js',
+    from: '    if (this.clinkPingTimer) {\n      clearInterval(this.clinkPingTimer);\n      this.clinkPingTimer = null;\n    }',
+    to: '',
+  },
+  {
+    id: 'M188', name: 'P1-04：结束会话遗留 500ms 初始化计时器', file: 'server.js',
+    from: '        if (initTimer) clearTimeout(initTimer);', to: '',
+  },
+  {
+    id: 'M189', name: 'P1-04：结束会话遗留 2500ms 观察计时器', file: 'server.js',
+    from: '        if (goalInitTimer) clearTimeout(goalInitTimer);', to: '',
+  },
+  {
+    id: 'M190', name: 'P1-04：任务观察重入锁失效', file: 'server.js',
+    from: 'if (cycleDone || checkingGoal || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;',
+    to: 'if (cycleDone || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;',
+  },
+  {
+    id: 'M191', name: 'P1-04：失败任务读取再次使用旧完成快照', file: 'server.js',
+    from: 'if (cycleDone || !taskRead?.ok) return;', to: 'if (cycleDone) return;',
+  },
+  {
+    id: 'M192', name: 'P1-04：打卡倒计时重新被任务计数归零', file: 'server.js',
+    from: 'this.metrics.lastHeartbeatResult = `[${desktopName}] 桌面登录认领保持中，等待官方任务中心确认【${watchTaskName}】...`;',
+    to: 'this.metrics.lastHeartbeatResult = `[${desktopName}] 桌面登录认领保持中，等待官方任务中心确认【${watchTaskName}】...`; this.metrics.cycleCountdown = Math.max(0, Math.round((totSec - curSec) / 1000));',
+  },
+  {
+    id: 'M193', name: 'P1-04：112 ID 不再限制整数', file: 'server.js',
+    from: 'if (!Number.isInteger(numDesktopId) || numDesktopId < 0 || numDesktopId > 0xffffffff)',
+    to: 'if (numDesktopId < 0 || numDesktopId > 0xffffffff)',
+  },
+  {
+    id: 'M194', name: 'P1-04：112 构造失败再次静默吞掉', file: 'server.js',
+    from: "                  appendLog('Heartbeat', `[${accName}][${desktopName}] 112 认领报文构造失败: ${e.message}`, 'warning');",
+    to: '',
+  },
+  {
+    id: 'M195', name: 'P1-04：任务观察异常不再留证', file: 'server.js',
+    from: "                    appendLog('Heartbeat', `[${accName}][${desktopName}] 目标任务进度查询失败: ${e.message}`, 'warning');",
+    to: '',
+  },
+  {
+    id: 'M196', name: 'P1-04：任务查询返回后忽略会话已结束', file: 'server.js',
+    from: 'if (cycleDone || !taskRead?.ok) return;', to: 'if (!taskRead?.ok) return;',
+  },
+  {
+    id: 'M197', name: 'P1-04：空续期结果再次记为成功', file: 'server.js',
+    from: "            if (!newInfo) throw new Error('续期未返回有效会话');", to: '',
+  },
+  {
+    id: 'M198', name: 'P1-04：停止 Worker 不再清理挂机重试和打卡复检', file: 'server.js',
+    from: '    this.clearHangRetry();\n    this.clearSignVerify();', to: '',
+  },
 ];
 
 // ---------------------------------------------------------------------------

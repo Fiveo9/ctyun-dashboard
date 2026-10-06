@@ -58,7 +58,7 @@
 | `P1-01` | P1 | `server.js` | 修复飞书通知未用剥离后 URL 与管理员测推送漏传 `secret` | `server.js` | [x] |
 | `P1-02` | P1 | `server.js` | 修复 `checkExternalPowerOn` 强行覆写用户手动关闭的保活开关 | `server.js` | [x] |
 | `P1-03` | P1 | `server.js` | 修复 `refreshOfficialTasks` 40010 未重试及用积分结果掩盖任务读取失败 | `server.js` | [x] |
-| `P1-04` | P1 | `server.js` | 修复 12h 续期风暴、`stopKeepAliveWorker` 定时器泄漏与打卡倒计时误清零 | `server.js` | [ ] |
+| `P1-04` | P1 | `server.js` | 修复 12h 续期风暴、`stopKeepAliveWorker` 定时器泄漏与打卡倒计时误清零 | `server.js` | [x] |
 | `P1-05` | P1 | `app/tasks` | 修复 `TaskScheduler` 多平台串扰、重复触发、`NaN` 死循环与无超时下单 | `app/tasks/scheduler.js`, `app/tasks/native_tasks.js` | [ ] |
 | `P1-06` | P1 | `server.js`, `auth_manager.js`, `ctyun_encryption.js` | 路由异常兜底、请求体限制、侧车进程清理、平台守卫、配额 `0` 修复 | `server.js`, `app/auth_manager.js`, `app/ctyun_encryption.js` | [ ] |
 | `P1-07` | P1 | `ydpc_client.js` | 修复 `verifyKeepAliveEffect` 必现 `ReferenceError: originCn is not defined` | `app/ydpc/ydpc_client.js` | [ ] |
@@ -314,6 +314,7 @@
   1. 在 `CtYunClient` 增加 `this._renewingToken = false` 与 `this._tokenRenewRetryAt = 0`。`runCycleLoop` 中满足 12h 且 `!this._renewingToken && Date.now() >= this._tokenRenewRetryAt` 时置 `this._renewingToken = true`，成功后更新 `lastTokenRenewAt = Date.now()`，失败后设 `this._tokenRenewRetryAt = Date.now() + 15 * 60 * 1000` 并打 warning 日志，在 `finally` 复位 `_renewingToken`。
   2. `stopKeepAliveWorker()` 补充清理：`if (this.endCurrentSession) this.endCurrentSession('Worker Stopped');`、清理 `clinkPingTimer`、`clearHangRetry()`、`clearSignVerify()`。
   3. 在 `runDesktopKeepAliveSession` 内部保存 `initTimer` 和 `goalInitTimer`，并在 `endSession` 中全部 `clearTimeout`；给 `checkGoalProgress` 加 `let checkingGoal = false` 重入锁与 `try/catch`；第 2703 行在非 `isGoalHang`（即打卡模式）下不要把 `cycleCountdown` 覆盖成 `(totSec - curSec)/1000`；第 2626 行先校验 `Number.isInteger(numDesktopId) && numDesktopId >= 0 && numDesktopId <= 0xffffffff`，并在 `catch (e)` 记录错误日志而非静默吞掉。
+- **执行记录（2026-11-24）**：原代码已在续期成功回调更新时间，本项仅补 pending 互斥、失败/空结果 warning、15 分钟退避和 finally 解锁；停止 Worker 结束会话并清理五类计时器。会话结束取消 500ms/2500ms 初始化和观察计时器，观察回调防重入、捕获异常、在异步返回后检查会话结束及本轮任务读取成功，避免旧完成快照假报；打卡保留窗口倒计时，挂机仍使用剩余秒数，112 ID 限 uint32 并留证。新增 7 项离线行为回归、17 项变异（M182–M198）；先复现 241 通过/7 失败（exit=1），修复后完整 `npm test` 为 248 通过/0 失败、18 个 JS 文件语法通过（exit=0），只读 review 及新增变异目标唯一匹配检查通过。未修改协议操作码、抢占证据、TLS 或开关入口；完整阶段变异尚待 P1-06 后运行。
 
 ---
 

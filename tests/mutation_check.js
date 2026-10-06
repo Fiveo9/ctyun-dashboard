@@ -1611,6 +1611,20 @@ const MUTATIONS = [
     from: 'if (currentUser && currentUser.id === userId) logoutUser();',
     to: 'logoutUser();',
   },
+  {
+    id: 'M172',
+    name: 'P1-01：管理员测试通知丢失签名透传与配置继承',
+    file: 'server.js',
+    from: "secret: body.secret ?? appConfig.settings?.notify?.secret ?? '',",
+    to: "secret: '',",
+  },
+  {
+    id: 'M173',
+    name: 'P1-01：飞书 URL 后缀错误覆盖独立签名字段',
+    file: 'server.js',
+    from: 'feishuSecret = feishuSecret || split.secret;',
+    to: 'feishuSecret = split.secret;',
+  },
 ];
 
 // ---------------------------------------------------------------------------

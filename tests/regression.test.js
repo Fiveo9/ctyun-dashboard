@@ -6283,6 +6283,67 @@ testAsync('P0-07：侧车登录/短信/重登清密码，IPC 无裸 Token，POSI
   assert.strictEqual(report.posixContract, 'simulated', 'Windows 契约模拟不能写成 Linux 实测');
 });
 
+group('Phase 2 · 主服务与调度器修复');
+
+testAsync('P1-01：管理员通知测试透传签名，未提供时继承配置，显式空值可清空且鉴权不变', async () => {
+  const storedSignature = 'fixture-stored-signature';
+  for (const sample of [
+    { body: { secret: 'fixture-new-signature' }, expected: 'fixture-new-signature' },
+    { body: {}, expected: storedSignature },
+    { body: { secret: null }, expected: storedSignature },
+    { body: { secret: '' }, expected: '' },
+  ]) {
+    const sent = [];
+    const harness = makePhase1RouteHarness({ userId: 'u_admin', role: 'admin', username: 'fixture-admin' }, {
+      appConfig: { accounts: [], settings: { notify: { channel: 'feishu', webhookUrl: 'https://notify.example/hook', secret: storedSignature } } },
+      parseJsonBody: async () => sample.body, isValidWebhookTarget: () => true,
+      sendNotification: async settings => { sent.push(settings.notify); return { success: true }; },
+    });
+    const call = harness.request('/api/notify/test', 'POST');
+    await call.run();
+    assert.strictEqual(call.res.statusCode, 200);
+    assert.strictEqual(sent.length, 1);
+    assert.ok(sent[0].secret === sample.expected, '管理员通知测试必须保留签名透传/继承/显式清空语义');
+  }
+  for (const [session, status] of [[null, 401], [{ role: 'user' }, 403]]) {
+    const harness = makePhase1RouteHarness(session, { sendNotification: () => { throw new Error('未授权不得发送通知'); } });
+    const call = harness.request('/api/notify/test', 'POST');
+    await call.run();
+    assert.strictEqual(call.res.statusCode, status);
+  }
+  const invalid = makePhase1RouteHarness({ role: 'admin' }, {
+    parseJsonBody: async () => ({ channel: 'feishu', webhookUrl: 'http://127.0.0.1/hook' }),
+    isValidWebhookTarget: () => false, sendNotification: () => { throw new Error('非法目标不得发出'); },
+  }).request('/api/notify/test', 'POST');
+  await invalid.run();
+  assert.strictEqual(invalid.res.statusCode, 400, '不得削弱 P0 的通知目标校验');
+});
+
+testAsync('P1-01：飞书实际签名使用独立字段优先，URL 后缀不发往网络且仍禁重定向/超时', async () => {
+  const crypto = require('crypto');
+  const calls = [];
+  const api = makePhase1PublicUrlHarness({ fetchWithTimeout: async (url, options, timeout) => {
+    calls.push({ url, options, timeout });
+    return { ok: true, status: 200, json: async () => ({ code: 0 }) };
+  } });
+  for (const sample of [
+    { webhookUrl: 'https://notify.example/hook', secret: 'fixture-separate-signature', expected: 'fixture-separate-signature' },
+    { webhookUrl: 'https://notify.example/hook@fixture-url-signature', secret: 'fixture-separate-signature', expected: 'fixture-separate-signature' },
+    { webhookUrl: 'https://notify.example/hook@fixture-url-signature', expected: 'fixture-url-signature' },
+  ]) {
+    const result = await api.sendNotification({ notify: { enabled: true, channel: 'feishu', webhookUrl: sample.webhookUrl, secret: sample.secret } }, '测试', '内容');
+    assert.strictEqual(result.success, true);
+    const call = calls.at(-1);
+    assert.strictEqual(call.url, 'https://notify.example/hook');
+    assert.strictEqual(call.options.redirect, 'error');
+    assert.strictEqual(call.timeout, 15000);
+    const payload = JSON.parse(call.options.body);
+    assert.match(payload.timestamp, /^\d+$/);
+    const expected = crypto.createHmac('sha256', `${payload.timestamp}\n${sample.expected}`).update('').digest('base64');
+    assert.ok(payload.sign === expected, '飞书签名字段优先级或算法不正确');
+  }
+});
+
 // ============================================================================
 // 汇总输出（先跑完全部异步断言，再统一出结果）
 // ============================================================================

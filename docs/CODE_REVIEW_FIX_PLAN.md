@@ -55,7 +55,7 @@
 | `P0-05` | P0 | `app/ydpc` | 关闭 `cag_boot.js` 默认 wireLog 凭据泄露；恢复 `mqtt_client.js` TLS 校验 | `app/ydpc/cag_boot.js`, `app/ydpc/mqtt_client.js` | [x] |
 | `P0-06` | P0 | `app/static` | 移除第三方二维码外链，本地生成扫码登录二维码 | `app/static/app.js`, `server.js` | [x] |
 | `P0-07` | P0 | `auth_manager.js`, `sidecar.py`, 全局 | `scrypt` 密码哈希升级、改密吊销会话、`0600` 落盘与安全随机数 | `app/auth_manager.js`, `app/ecloud_engine/sidecar.py`, `native_tasks.js`, `soho_client.js`, `server.js` | [x] |
-| `P1-01` | P1 | `server.js` | 修复飞书通知未用剥离后 URL 与管理员测推送漏传 `secret` | `server.js` | [ ] |
+| `P1-01` | P1 | `server.js` | 修复飞书通知未用剥离后 URL 与管理员测推送漏传 `secret` | `server.js` | [x] |
 | `P1-02` | P1 | `server.js` | 修复 `checkExternalPowerOn` 强行覆写用户手动关闭的保活开关 | `server.js` | [ ] |
 | `P1-03` | P1 | `server.js` | 修复 `refreshOfficialTasks` 40010 未重试及用积分结果掩盖任务读取失败 | `server.js` | [ ] |
 | `P1-04` | P1 | `server.js` | 修复 12h 续期风暴、`stopKeepAliveWorker` 定时器泄漏与打卡倒计时误清零 | `server.js` | [ ] |
@@ -274,6 +274,7 @@
   1. `server.js:716` 改为 `fetchWithTimeout(feishuUrl, ..., 15000)`。
   2. `server.js:6247-6255` 补上 `secret: body.secret ?? appConfig.settings?.notify?.secret ?? ''`（与第 6212 行 `/api/user/notify/test` 保持一致）。
 - **验收**：飞书带 `@secret` 签名发送目标 URL 不再携带 `@secret` 后缀；管理员面板配置钉钉/飞书加签测试推送可校验通过。
+- **执行记录（2026-11-24）**：飞书 URL 剥离、安全 DNS 连接固定和 15 秒预算已在 Phase 1 修复，本项保持统一安全发送入口不重做。补齐管理员通知测试的独立签名字段透传、未提供时配置继承和显式空字符串清空语义；锁住飞书独立字段优先于 URL 签名后缀、管理员鉴权与非法目标拒绝。新增 2 项离线行为回归、2 项变异（M172–M173）；先复现 235 通过/1 失败（exit=1），修复后完整 `npm test` 为 236 通过/0 失败、18 个 JS 文件语法通过（exit=0），已做只读 review。未发送真实通知；完整阶段变异于 P1-06 完成后统一运行。
 
 ---
 

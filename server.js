@@ -6558,6 +6558,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         enabled: true,
         channel: body.channel || appConfig.settings?.notify?.channel,
         webhookUrl: testUrl,
+        secret: body.secret ?? appConfig.settings?.notify?.secret ?? '',
         customTitleTemplate: body.customTitleTemplate || appConfig.settings?.notify?.customTitleTemplate,
         customContentTemplate: body.customContentTemplate || appConfig.settings?.notify?.customContentTemplate
       }

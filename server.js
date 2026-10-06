@@ -21,6 +21,7 @@ const { performCagAuthHold } = require('./app/ydpc/cag_client');
 const { YdpcClient } = require('./app/ydpc/ydpc_client');
 const { EcloudClient, LOG_SOURCE: ECLOUD_LOG_SOURCE, INTERACTIVE_BRANCHES } = require('./app/ecloud/ecloud_client');
 const { LogPersister } = require('./app/persist_log');
+const { generateQrSvgDataUrl } = require('./app/utils/qrcode');
 
 // 全局异常拦截看门狗 (确保守护服务长期稳定运行不宕机)
 // 【2026-09-27 退出取证】现场：面板曾静默死亡一次（exit=1、stdout/stderr 零输出、
@@ -5386,11 +5387,17 @@ function rewardNeedsDesktop(prodId, prodType) {
     const tempClient = new CtYunClient({ deviceCode: devCode, user: 'qrcode_temp' });
     try {
       const qrData = await tempClient.genQrCode();
+      let qrImageDataUrl = '';
+      let qrImageError = '';
+      try { qrImageDataUrl = generateQrSvgDataUrl(qrData.qrUrl); }
+      catch (error) { qrImageError = '二维码图片生成失败，请复制登录链接或重试'; }
       jsonResponse(res, {
         success: true,
         deviceCode: devCode,
         qrCodeId: qrData.qrCodeId,
-        qrUrl: qrData.qrUrl
+        qrUrl: qrData.qrUrl,
+        qrImageDataUrl,
+        ...(qrImageError ? { qrImageError } : {})
       });
     } catch (e) {
       jsonResponse(res, { error: e.message || '生成官方二维码失败' }, 500);

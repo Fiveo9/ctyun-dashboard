@@ -2628,7 +2628,7 @@ async function loadQrCodeForModal() {
   const hintEl = document.getElementById("acc-qrcode-hint");
 
   if (imgEl) imgEl.style.display = "none";
-  if (loadingEl) { loadingEl.style.display = "flex"; loadingEl.innerText = "正在生成官方二维码..."; }
+  if (loadingEl) { loadingEl.classList.add('skeleton'); loadingEl.style.flexDirection = ''; loadingEl.style.display = "flex"; loadingEl.innerText = "正在生成官方二维码..."; }
   if (hintEl) { hintEl.innerText = "等待扫码确认中..."; hintEl.style.color = "#2563eb"; }
 
   try {
@@ -2636,14 +2636,18 @@ async function loadQrCodeForModal() {
     const data = await res.json();
     if (res.ok && data.success && data.qrUrl) {
       currentQrCodeId = data.qrCodeId;
-      // 使用快速 QR 渲染引擎
-      const qrApiUrl = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(data.qrUrl)}`;
+      // 图片已由服务端本地编码，授权链接不发送给第三方图片服务。
       if (imgEl) {
-        imgEl.src = qrApiUrl;
         imgEl.onload = () => {
           imgEl.style.display = "block";
           if (loadingEl) loadingEl.style.display = "none";
         };
+        imgEl.onerror = () => showQrLoadFallback(data.qrUrl);
+        if (typeof data.qrImageDataUrl === 'string' && data.qrImageDataUrl.startsWith('data:image/svg+xml;base64,')) {
+          imgEl.src = data.qrImageDataUrl;
+        } else {
+          showQrLoadFallback(data.qrUrl);
+        }
       }
 
       // 启动 2 秒轮询看门狗 (每次轮询动态读取用户实时填写的账号备注名与目标重登账号ID)
@@ -2675,11 +2679,39 @@ async function loadQrCodeForModal() {
         } catch (e) {}
       }, 2000);
     } else {
-      if (loadingEl) loadingEl.innerText = "获取二维码失败: " + (data.error || '接口异常');
+      showQrLoadFallback('', '获取二维码失败: ' + (data.error || '接口异常'));
     }
   } catch (e) {
-    if (loadingEl) loadingEl.innerText = "网络异常，点击重试";
+    showQrLoadFallback('', '网络异常，点击重试');
   }
+}
+
+function showQrLoadFallback(qrUrl, message = '') {
+  const img = document.getElementById('acc-qrcode-img');
+  const loading = document.getElementById('acc-qrcode-loading');
+  if (img) img.style.display = 'none';
+  if (!loading) return;
+  loading.classList.remove('skeleton');
+  loading.style.display = 'flex';
+  loading.style.flexDirection = 'column';
+  loading.innerText = message || (qrUrl ? '二维码图片加载失败，请复制链接或重试' : '获取二维码失败，请重试');
+  if (qrUrl) {
+    const link = document.createElement('input');
+    link.type = 'text'; link.readOnly = true; link.value = qrUrl;
+    link.className = 'form-control'; link.style.width = '100%';
+    loading.appendChild(link);
+    const copy = document.createElement('button');
+    copy.type = 'button'; copy.className = 'btn btn-sm'; copy.innerText = '复制登录链接';
+    copy.onclick = async () => {
+      try { await navigator.clipboard.writeText(qrUrl); showToast('登录链接已复制', 'success'); }
+      catch (error) { link.select(); showToast('请手动复制登录链接', 'info'); }
+    };
+    loading.appendChild(copy);
+  }
+  const retry = document.createElement('button');
+  retry.type = 'button'; retry.className = 'btn btn-sm btn-primary'; retry.innerText = '刷新二维码';
+  retry.onclick = () => loadQrCodeForModal();
+  loading.appendChild(retry);
 }
 
 function openAddAccountModal() {

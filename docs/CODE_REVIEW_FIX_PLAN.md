@@ -53,7 +53,7 @@
 | `P0-03` | P0 | `app/static`, `server.js` | 消除存储型 XSS、属性注入与服务端 HTML/Script 注入 | `app/static/app.js`, `server.js` | [x] |
 | `P0-04` | P0 | `server.js`, `app/static` | API 响应剥离明文密码与会话密钥，编辑弹窗不再回填明文密码 | `server.js`, `app/static/app.js` | [x] |
 | `P0-05` | P0 | `app/ydpc` | 关闭 `cag_boot.js` 默认 wireLog 凭据泄露；恢复 `mqtt_client.js` TLS 校验 | `app/ydpc/cag_boot.js`, `app/ydpc/mqtt_client.js` | [x] |
-| `P0-06` | P0 | `app/static` | 移除第三方二维码外链，本地生成扫码登录二维码 | `app/static/app.js`, `server.js` | [ ] |
+| `P0-06` | P0 | `app/static` | 移除第三方二维码外链，本地生成扫码登录二维码 | `app/static/app.js`, `server.js` | [x] |
 | `P0-07` | P0 | `auth_manager.js`, `sidecar.py`, 全局 | `scrypt` 密码哈希升级、改密吊销会话、`0600` 落盘与安全随机数 | `app/auth_manager.js`, `app/ecloud_engine/sidecar.py`, `native_tasks.js`, `soho_client.js`, `server.js` | [ ] |
 | `P1-01` | P1 | `server.js` | 修复飞书通知未用剥离后 URL 与管理员测推送漏传 `secret` | `server.js` | [ ] |
 | `P1-02` | P1 | `server.js` | 修复 `checkExternalPowerOn` 强行覆写用户手动关闭的保活开关 | `server.js` | [ ] |
@@ -220,6 +220,7 @@
   2. 在 `app.js:2631` 优先渲染本地 `qrImageDataUrl`（或本地前端渲染函数），彻底删除 `https://api.qrserver.com/...` 外链。
   3. 为 `#acc-qrcode-img` 绑定 `onerror` 回调：加载失败时隐藏骨架屏并展示可复制链接/重试按钮，避免骨架屏永久转圈。
 - **验收**：断网或阻断外网 `api.qrserver.com` 情况下，天翼云扫码登录弹窗可正常瞬间渲染出可扫描的二维码图片。
+- **执行记录（2026-11-24）**：服务端内置 MIT 许可 QR Model 2 字节编码模块，M 级纠错、1–40 版本，返回本地 SVG Data URI；前端移除第三方图片地址，图片失败停止骨架并显示复制链接/重试，保留 API 失败诊断。7 组矩阵匹配独立 Project Nayuki 参考（含 UTF-8、Version 32、最大容量），无新增运行时依赖。新增 2 项回归、2 项变异；223 通过、0 失败，16 个文件语法通过，已做只读 review。真实手机扫码仍未实测；官方授权链接获取仍需要官方网络。
 
 ---
 

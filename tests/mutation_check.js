@@ -1373,6 +1373,20 @@ const MUTATIONS = [
     from: 'if (!this.allowInsecure || this.isClosedManually || !certCode) throw error;',
     to: 'if (!this.allowInsecure || this.isClosedManually) throw error;',
   },
+  {
+    id: 'M138',
+    name: 'P0-06：二维码图片重新把授权链接发送给第三方',
+    file: 'app/static/app.js',
+    from: 'imgEl.src = data.qrImageDataUrl;',
+    to: 'imgEl.src = "https://api.qrserver.com/v1/create-qr-code/?data=" + encodeURIComponent(data.qrUrl);',
+  },
+  {
+    id: 'M139',
+    name: 'P0-06：QR 数据区域缺少标准掩码',
+    file: 'app/utils/qrcode.js',
+    from: 'if (!functions[y][x] && (x + y) % 2 === 0) modules[y][x] = !modules[y][x];',
+    to: 'if (false) modules[y][x] = !modules[y][x];',
+  },
 ];
 
 // ---------------------------------------------------------------------------

@@ -5520,7 +5520,8 @@ function makePhase1FrontendHarness(overrides = {}) {
     'buildYdpcVmMonitorHtml', 'buildEcloudDesktopMonitorHtml', 'ecloudViewTone',
     'formatYdpcRemainText', 'formatEcloudRemainText', 'htmlToPlainTitle',
     'buildAccountCardElement', 'logLineInnerHtml', 'openAdminUsersModal',
-    'editAccount', 'saveAccount', 'saveYdpcAccount', 'saveEcloudAccount'];
+    'editAccount', 'saveAccount', 'saveYdpcAccount', 'saveEcloudAccount',
+    'loadQrCodeForModal', 'showQrLoadFallback'];
   const source = names.map(name => phase1FunctionFrom(phase1AppSource, name)).join('\n') + `\n({ ${names.join(', ')} })`;
   const api = vm.runInNewContext(source, { document: { createElement: element },
     activeEditingAccId: null, _icon: () => '', isDetailsOpen: () => false,
@@ -5869,6 +5870,103 @@ testAsync('P0-05：MQTT 严格先行、IP 不发 SNI、显式开关和证书白�
   const failedTwice = await run('broker.example', true, ['CERT_HAS_EXPIRED', 'CERT_HAS_EXPIRED']);
   assert.ok(failedTwice.error);
   assert.strictEqual(failedTwice.attempts.length, 2, '最多只降级一次');
+});
+
+test('P0-06：本地 QR 字节矩阵符合独立标准向量，SVG 保留静区且不嵌入原始内容', () => {
+  const { createQrMatrix, generateQrSvgDataUrl } = require(path.join(ROOT, 'app/utils/qrcode.js'));
+  // Project Nayuki encodeSegments(makeBytes(UTF-8), MEDIUM, 1, 40, 0, false).
+  // 摘要由独立参考实现生成；回归执行时不访问网络或依赖该实现。
+  const vectors = [
+    ['HELLO', 1, '26af6f00ea417ee57ac6e345307b4deb10c0e71916f1749ce8eab417e7b70d7f'],
+    ['https://example.test/scan', 2, '08457f6eb8bb16e7b4ff85194cc8994778123c5d993fb77272accc8244a8a86f'],
+    ['云电脑✅', 1, 'a6b3ce6d56aad9b48e7a75e7a7ac2821f6d598edcee0a0766bd4dbe84cf7e8a3'],
+    ['A'.repeat(200), 10, 'a50263fbb94e57f2998b5467ecebfdb0d4c9e5e974674441278aab594de581e7'],
+    ['A'.repeat(900), 24, '2b9371aab8e5d2ff7ae6547bee4c76a5b35f5d20bf59930be7ffb77ba06cb072'],
+    ['A'.repeat(1500), 32, '5c4f9f1e84b05af85add822cf2af93d274a139b178d192db2880e194aa6acc17'],
+    ['A'.repeat(2331), 40, '04363f9ca029a3be6cd9b68933b59c0efae389d8b1e436310817153720409e2c'],
+  ];
+  for (const [text, version, expected] of vectors) {
+    const qr = createQrMatrix(text);
+    const bits = qr.modules.map(row => row.map(Number).join('')).join('');
+    assert.strictEqual(qr.version, version);
+    assert.strictEqual(require('crypto').createHash('sha256').update(bits).digest('hex'), expected, '字节布局/纠错/格式位必须匹配标准矩阵');
+  }
+  const payload = '<script>unsafe</script>';
+  const dataUrl = generateQrSvgDataUrl(payload);
+  assert.ok(dataUrl.startsWith('data:image/svg+xml;base64,'));
+  const svg = Buffer.from(dataUrl.split(',')[1], 'base64').toString();
+  assert.ok(!/<script|\bhref=|\bon\w+=/.test(svg), '原始内容不得进入 SVG 标签或属性');
+  assert.ok(/shape-rendering="crispEdges"/.test(svg));
+  const qr = createQrMatrix(payload);
+  assert.ok(svg.includes(`viewBox="0 0 ${qr.size + 8} ${qr.size + 8}"`), '四边必须保留 4 模块静区');
+  for (const match of svg.matchAll(/M(\d+),(\d+)h1v1h-1z/g)) {
+    assert.ok(Number(match[1]) >= 4 && Number(match[2]) >= 4);
+    assert.ok(Number(match[1]) < qr.size + 4 && Number(match[2]) < qr.size + 4);
+  }
+  assert.throws(() => createQrMatrix(''), /不能为空/);
+  assert.throws(() => createQrMatrix('A'.repeat(2332)), /最大容量/);
+});
+
+testAsync('P0-06：鉴权路由返回本地图片，前端无需第三方请求，错误时可复制/重试且骨架停止', async () => {
+  const { generateQrSvgDataUrl } = require(path.join(ROOT, 'app/utils/qrcode.js'));
+  const qrUrl = 'https://example.test/scan';
+  class QrClient { async genQrCode() { return { qrCodeId: 'fixture-id', qrUrl }; } }
+  const harness = makePhase1RouteHarness({ role: 'user' }, { CtYunClient: QrClient,
+    generateDeviceCode: () => 'web_fixture', generateQrSvgDataUrl,
+  });
+  const call = harness.request('/api/account/qrcode/generate', 'POST');
+  await call.run();
+  const data = JSON.parse(call.res.body);
+  assert.strictEqual(data.qrUrl, qrUrl);
+  assert.ok(data.qrImageDataUrl.startsWith('data:image/svg+xml;base64,'));
+  const anonymous = makePhase1RouteHarness().request('/api/account/qrcode/generate', 'POST');
+  await anonymous.run();
+  assert.strictEqual(anonymous.res.statusCode, 401);
+  const failedImage = makePhase1RouteHarness({ role: 'user' }, { CtYunClient: QrClient,
+    generateDeviceCode: () => 'web_fixture', generateQrSvgDataUrl: () => { throw new Error('fixture failure'); },
+  }).request('/api/account/qrcode/generate', 'POST');
+  await failedImage.run();
+  assert.strictEqual(JSON.parse(failedImage.res.body).qrUrl, qrUrl, '编码失败仍应提供已取得的授权链接');
+
+  const nodes = new Map();
+  const element = tag => {
+    const members = new Set();
+    let text = '';
+    const node = { tag, style: {}, children: [], value: '',
+      classList: { add: name => members.add(name), remove: name => members.delete(name), contains: name => members.has(name) },
+      appendChild(child) { this.children.push(child); }, select() { this.selected = true; },
+    };
+    Object.defineProperty(node, 'innerText', { get: () => text, set: value => { text = String(value); node.children = []; } });
+    return node;
+  };
+  const field = id => { if (!nodes.has(id)) nodes.set(id, element('div')); return nodes.get(id); };
+  const requests = [];
+  let copied;
+  let responseData = data;
+  const { api } = makePhase1FrontendHarness({ document: { getElementById: field, createElement: element },
+    qrPollingTimer: null, currentQrCodeId: '', setInterval: () => 1, clearInterval() {},
+    navigator: { clipboard: { writeText: async value => { copied = value; } } }, showToast() {},
+    authFetch: async url => { requests.push(url); return { ok: true, json: async () => responseData }; },
+  });
+  await api.loadQrCodeForModal();
+  const image = field('acc-qrcode-img');
+  const loading = field('acc-qrcode-loading');
+  assert.strictEqual(image.src, data.qrImageDataUrl, '只能渲染返回的本地 Data URI');
+  assert.deepStrictEqual(requests, ['/api/account/qrcode/generate'], '图片不得向第三方发请求');
+  image.onload();
+  assert.strictEqual(loading.style.display, 'none');
+  image.onerror();
+  assert.strictEqual(image.style.display, 'none');
+  assert.strictEqual(loading.classList.contains('skeleton'), false, '加载失败必须停止骨架');
+  assert.ok(loading.children.some(child => child.readOnly && child.value === qrUrl));
+  const copy = loading.children.find(child => child.innerText === '复制登录链接');
+  await copy.onclick();
+  assert.strictEqual(copied, qrUrl);
+  assert.ok(loading.children.some(child => child.innerText === '刷新二维码' && typeof child.onclick === 'function'));
+  responseData = { success: false, error: 'fixture error' };
+  await api.loadQrCodeForModal();
+  assert.ok(loading.innerText.includes('fixture error'), 'API 失败诊断不得丢失');
+  assert.ok(loading.children.some(child => child.innerText === '刷新二维码'));
 });
 
 // ============================================================================

@@ -25,6 +25,7 @@ const FILES = [
   'app/ydpc/scg_keepalive.js',
   'app/ecloud/ecloud_engine.js',
   'app/ecloud/ecloud_client.js',
+  'app/static/icons.js',
   'app/static/app.js',
 ];
 

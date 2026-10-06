@@ -6309,6 +6309,36 @@ function phase2PowerRestoreHarness(account) {
     get started() { return started; }, get saved() { return saved; } };
 }
 
+function phase2OfficialTasksHarness(tasks, points, renewal = 'ok') {
+  const requests = [];
+  const warnings = [];
+  let taskCalls = 0;
+  let renewals = 0;
+  let generation = 0;
+  const oldTasks = [{ name: '旧任务快照', current: 0, total: 1 }];
+  const client = { loginInfo: { fixture: true }, account: { name: 'fixture-tasks', stats: {} },
+    metrics: { officialTasks: oldTasks, userPoints: 0 },
+    getSignedHeaders: () => ({ fixtureGeneration: generation }),
+    renewToken: async () => { renewals++; if (renewal === 'throw') throw new Error('fixture renewal failed');
+      if (renewal === 'false') return false; generation++; return { fixture: true }; },
+  };
+  const api = phase2CtYunMethods(['async refreshOfficialTasks()'], {
+    getBeijingDateOnly: () => '2026-11-24', getBeijingTimeString: () => '2026-11-24 12:00:00', saveConfig() {},
+    appendLog: (...args) => warnings.push(args),
+    fetchWithTimeout: async (url, options) => {
+      requests.push({ url, headers: options.headers });
+      let data;
+      if (url.endsWith('/getTaskList')) { data = tasks[Math.min(taskCalls, tasks.length - 1)]; taskCalls++; }
+      else if (url.endsWith('/getUserPoints')) data = points;
+      else throw new Error('测试不得访问未指定端点');
+      if (data instanceof Error) throw data;
+      return { ok: data.code === 0, status: data.code === 0 ? 200 : 500, json: async () => data };
+    },
+  });
+  return { client, oldTasks, requests, warnings, refresh: () => api.refreshOfficialTasks.call(client),
+    get taskCalls() { return taskCalls; }, get renewals() { return renewals; } };
+}
+
 testAsync('P1-01：管理员通知测试透传签名，未提供时继承配置，显式空值可清空且鉴权不变', async () => {
   const storedSignature = 'fixture-stored-signature';
   for (const sample of [
@@ -6404,6 +6434,63 @@ test('P1-02：仅电源联动暂停可恢复，空 features 安全初始化，�
     assert.strictEqual(h.started, 1);
     assert.strictEqual(h.saved, 1);
   }
+});
+
+testAsync('P1-03：任务列表失败不得被积分成功掩盖，旧快照不作为本轮成功依据', async () => {
+  for (const failure of [{ code: 500, msg: 'fixture task failure' }, new Error('fixture task timeout'), { code: 0, data: {} }]) {
+    const h = phase2OfficialTasksHarness([failure], { code: 0, data: [{ points: 100, pointType: 1, willOutDate: true }, { points: 900, pointType: 1 }] });
+    const result = await h.refresh();
+    assert.strictEqual(result.ok, false, '积分成功不得把任务列表失败改为成功');
+    assert.strictEqual(result.pointsOk, true, '积分读取必须独立保留成功状态');
+    assert.strictEqual(h.client.metrics.officialTasks, h.oldTasks, '失败不得把旧任务当成新任务');
+    assert.strictEqual(h.client.account.stats.points, 900);
+    assert.ok(result.reason && h.warnings.length > 0, '任务失败必须保留原因和 warning');
+  }
+});
+
+testAsync('P1-03：40010/会话过期续期后同轮重试一次，失败续期或重复过期不得无限重发', async () => {
+  const successful = { code: 0, data: [{ taskDefName: '登录AI云电脑', currentProgress: 1, totalProgress: 1, status: 2 }] };
+  for (const expired of [{ code: 40010, msg: 'expired' }, { code: 1, msg: '会话已过期' }]) {
+    const h = phase2OfficialTasksHarness([expired, successful], { code: 0, data: [{ points: 0, pointType: 1 }] });
+    const result = await h.refresh();
+    assert.strictEqual(h.renewals, 1);
+    assert.strictEqual(h.taskCalls, 2, '续期成功后必须重读任务列表');
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.pointsOk, true);
+    assert.strictEqual(result.reason, '');
+    assert.strictEqual(h.requests[0].headers.fixtureGeneration, 0);
+    assert.strictEqual(h.requests[1].headers.fixtureGeneration, 1, '重试必须获取新会话的签名头');
+    assert.strictEqual(h.client.account.stats.lastSignTime, '2026-11-24 12:00:00');
+  }
+  for (const renewal of ['false', 'throw']) {
+    const h = phase2OfficialTasksHarness([{ code: 40010 }], { code: 0, data: [{ points: 1, pointType: 1 }] }, renewal);
+    const result = await h.refresh();
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.pointsOk, true);
+    assert.strictEqual(h.taskCalls, 1);
+    assert.strictEqual(h.renewals, 1);
+  }
+  const twice = phase2OfficialTasksHarness([{ code: 40010 }, { code: 40010 }], { code: 0, data: [{ points: 1, pointType: 1 }] });
+  const failed = await twice.refresh();
+  assert.strictEqual(failed.ok, false);
+  assert.strictEqual(twice.renewals, 1);
+  assert.strictEqual(twice.taskCalls, 2);
+});
+
+testAsync('P1-03：任务列表成功不被积分失败否定，空任务列表有效，未登录返回两个失败状态', async () => {
+  for (const points of [{ code: 500 }, new Error('fixture points timeout')]) {
+    const h = phase2OfficialTasksHarness([{ code: 0, data: [] }], points);
+    const result = await h.refresh();
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.pointsOk, false);
+    assert.strictEqual(h.client.metrics.officialTasks.length, 0);
+  }
+  const noLogin = phase2OfficialTasksHarness([{ code: 0, data: [] }], { code: 0, data: [] });
+  noLogin.client.loginInfo = null;
+  const result = await noLogin.refresh();
+  assert.strictEqual(result.ok, false);
+  assert.strictEqual(result.pointsOk, false);
+  assert.strictEqual(noLogin.requests.length, 0);
 });
 
 // ============================================================================

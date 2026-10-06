@@ -57,7 +57,7 @@
 | `P0-07` | P0 | `auth_manager.js`, `sidecar.py`, 全局 | `scrypt` 密码哈希升级、改密吊销会话、`0600` 落盘与安全随机数 | `app/auth_manager.js`, `app/ecloud_engine/sidecar.py`, `native_tasks.js`, `soho_client.js`, `server.js` | [x] |
 | `P1-01` | P1 | `server.js` | 修复飞书通知未用剥离后 URL 与管理员测推送漏传 `secret` | `server.js` | [x] |
 | `P1-02` | P1 | `server.js` | 修复 `checkExternalPowerOn` 强行覆写用户手动关闭的保活开关 | `server.js` | [x] |
-| `P1-03` | P1 | `server.js` | 修复 `refreshOfficialTasks` 40010 未重试及用积分结果掩盖任务读取失败 | `server.js` | [ ] |
+| `P1-03` | P1 | `server.js` | 修复 `refreshOfficialTasks` 40010 未重试及用积分结果掩盖任务读取失败 | `server.js` | [x] |
 | `P1-04` | P1 | `server.js` | 修复 12h 续期风暴、`stopKeepAliveWorker` 定时器泄漏与打卡倒计时误清零 | `server.js` | [ ] |
 | `P1-05` | P1 | `app/tasks` | 修复 `TaskScheduler` 多平台串扰、重复触发、`NaN` 死循环与无超时下单 | `app/tasks/scheduler.js`, `app/tasks/native_tasks.js` | [ ] |
 | `P1-06` | P1 | `server.js`, `auth_manager.js`, `ctyun_encryption.js` | 路由异常兜底、请求体限制、侧车进程清理、平台守卫、配额 `0` 修复 | `server.js`, `app/auth_manager.js`, `app/ctyun_encryption.js` | [ ] |
@@ -297,6 +297,7 @@
   2. 当 `taskRes` 返回 40010/会话过期并成功 `renewToken()` 后，立即重发一次 `getTaskList` 请求更新 `taskRes`（避免同一轮直接失败）。
   3. 仅当 `getTaskList` 成功解析并更新 `this.metrics.officialTasks` 时才置 `tasksOk = true`；函数最终返回 `{ ok: tasksOk, pointsOk, reason }`（`ok` 必须真实代表任务列表是否可读，不可被 `pointsOk` 覆盖成 `true`）。
 - **验收**：Mock `getTaskList` 500 失败而 `getUserPoints` 成功时，`refreshOfficialTasks()` 必须返回 `{ ok: false }`。
+- **执行记录（2026-11-24）**：任务列表成功状态与积分成功状态已分离；40010/会话过期续期成功后同轮以新签名头重读一次，失败续期或第二次过期不无限重发。任务异常、错误码或无效列表不能被积分成功掩盖，任务成功也不被积分失败否定；保留原任务映射、完成时间追踪、积分优先级及按统计变化落盘。新增 3 项行为回归、5 项变异（M177–M181）；先复现 238 通过/3 失败（exit=1），修复后完整 `npm test` 为 241 通过/0 失败、18 个 JS 文件语法通过（exit=0），已做只读 review。请求、续期、保存均离线打桩；完整阶段变异尚待 P1-06 后运行。
 
 ---
 

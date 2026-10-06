@@ -2355,26 +2355,33 @@ class CtYunClient {
    * 现在返回 { ok, reason }：ok=false 表示本次数据不可信，任何"判定"都必须放弃而不是猜。
    */
   async refreshOfficialTasks() {
-    if (!this.loginInfo) return { ok: false, reason: '账号尚未登录，无法读取官方任务中心' };
+    if (!this.loginInfo) return { ok: false, pointsOk: false, reason: '账号尚未登录，无法读取官方任务中心' };
 
     const statKeys = ['lastSignTime', 'lastAiChatTime', 'lastHangTime', 'hangMinutesToday', 'points'];
     const snapStats = () => JSON.stringify(statKeys.map(k => this.account?.stats?.[k] ?? null));
     const beforeStats = snapStats();
 
-    let ok = false;
+    let tasksOk = false;
+    let pointsOk = false;
     let reason = '';
 
     try {
-      const taskRes = await (await fetchWithTimeout('https://desk.ctyun.cn/selforder/api/marketing/userPoints/getTaskList', {
+      let taskRes = await (await fetchWithTimeout('https://desk.ctyun.cn/selforder/api/marketing/userPoints/getTaskList', {
         headers: this.getSignedHeaders()
       })).json();
 
       if (taskRes.code === 40010 || String(taskRes.msg || '').includes('登录信息已过期') || String(taskRes.msg || '').includes('会话已过期')) {
-        await this.renewToken().catch(() => {});
-        reason = `凭据过期 (code=${taskRes.code || taskRes.msg})`;
+        const renewed = await this.renewToken();
+        if (renewed) {
+          taskRes = await (await fetchWithTimeout('https://desk.ctyun.cn/selforder/api/marketing/userPoints/getTaskList', {
+            headers: this.getSignedHeaders()
+          })).json();
+        } else {
+          reason = `凭据过期，续期未完成 (code=${taskRes.code || taskRes.msg})`;
+        }
       }
 
-      if (taskRes.code === 0 && taskRes.data) {
+      if (taskRes.code === 0 && Array.isArray(taskRes.data)) {
         this.metrics.officialTasks = taskRes.data.map(t => ({
           name: t.taskDefName,
           current: t.currentProgress || 0,
@@ -2412,11 +2419,16 @@ class CtYunClient {
             }
           }
         }
-        ok = true;
+        tasksOk = true;
+        reason = '';
       } else if (!reason) {
         reason = `任务中心返回异常 code=${taskRes.code} msg=${taskRes.msg || '(无)'}`;
       }
+    } catch (e) {
+      reason = `官方任务中心访问失败: ${e.message}`;
+    }
 
+    try {
       const pointRes = await (await fetchWithTimeout('https://desk.ctyun.cn/selforder/api/marketing/userPoints/getUserPoints', {
         headers: this.getSignedHeaders()
       })).json();
@@ -2428,12 +2440,12 @@ class CtYunClient {
                           pointRes.data.reduce((max, cur) => ((cur.points || 0) > (max.points || 0) ? cur : max), pointRes.data[0]);
         this.metrics.userPoints = validItem ? (validItem.points || 0) : 0;
         this.account.stats.points = this.metrics.userPoints;
-        ok = true;
+        pointsOk = true;
       } else if (!reason) {
         reason = `积分接口返回异常 code=${pointRes.code}`;
       }
     } catch (e) {
-      reason = `官方任务中心访问失败: ${e.message}`;
+      if (!reason) reason = `积分接口访问失败: ${e.message}`;
     }
 
     // 仅在统计字段确实发生变化时落盘 (原先每次调用都 saveConfig，在容器挂载 NAS 卷场景下为高频无效写盘)
@@ -2441,10 +2453,10 @@ class CtYunClient {
       try { saveConfig(appConfig); } catch (e) { /* 落盘失败不影响本次判定 */ }
     }
 
-    if (!ok) {
+    if (!tasksOk) {
       appendLog('System', `[${this.account?.name || this.account?.user || ''}] ⚠️ 官方任务中心刷新未取得有效数据 (${reason})。本次结果不可信，系统不会据此判定任何任务成败。`, 'warning');
     }
-    return { ok, reason };
+    return { ok: tasksOk, pointsOk, reason };
   }
 
   async getRewards() {

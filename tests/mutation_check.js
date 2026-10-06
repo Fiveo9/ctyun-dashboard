@@ -1646,6 +1646,41 @@ const MUTATIONS = [
     from: 'if (isRunning && this.account.enabled !== false && this.account.manualShutdown === true) {\n      this.account.features = this.account.features || {};',
     to: 'if (isRunning && this.account.enabled !== false && this.account.manualShutdown === true) {',
   },
+  {
+    id: 'M177',
+    name: 'P1-03：积分成功再次掩盖任务列表失败',
+    file: 'server.js',
+    from: 'return { ok: tasksOk, pointsOk, reason };',
+    to: 'return { ok: pointsOk, pointsOk, reason };',
+  },
+  {
+    id: 'M178',
+    name: 'P1-03：续期成功后不再重读任务列表',
+    file: 'server.js',
+    from: "          taskRes = await (await fetchWithTimeout('https://desk.ctyun.cn/selforder/api/marketing/userPoints/getTaskList', {\n            headers: this.getSignedHeaders()\n          })).json();",
+    to: '          taskRes = taskRes;',
+  },
+  {
+    id: 'M179',
+    name: 'P1-03：积分成功状态不再独立返回',
+    file: 'server.js',
+    from: '        pointsOk = true;',
+    to: '        pointsOk = false;',
+  },
+  {
+    id: 'M180',
+    name: 'P1-03：任务读取失败后提前返回，积分独立读取丢失',
+    file: 'server.js',
+    from: "      const pointRes = await (await fetchWithTimeout('https://desk.ctyun.cn/selforder/api/marketing/userPoints/getUserPoints', {",
+    to: "      if (!tasksOk) return { ok: tasksOk, pointsOk, reason }; const pointRes = await (await fetchWithTimeout('https://desk.ctyun.cn/selforder/api/marketing/userPoints/getUserPoints', {",
+  },
+  {
+    id: 'M181',
+    name: 'P1-03：任务状态初始即成功，异常分支被误报',
+    file: 'server.js',
+    from: '    let tasksOk = false;',
+    to: '    let tasksOk = true;',
+  },
 ];
 
 // ---------------------------------------------------------------------------

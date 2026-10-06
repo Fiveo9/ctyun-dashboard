@@ -5267,6 +5267,124 @@ testAsync('行为：pingCag 对 SCG 机与材料缺失机必须"返回未执行"
 });
 
 // ============================================================================
+// Phase 1 · P0 安全加固（源码在隔离上下文中执行，不启动生产服务）
+// ============================================================================
+group('Phase 1 · P0 安全加固');
+
+function makePhase1RouteHarness(session = null, overrides = {}) {
+  const vm = require('vm');
+  const { EventEmitter } = require('events');
+  const start = server.indexOf('const server = http.createServer(');
+  const end = server.indexOf('\n});', start) + 4;
+  assert.ok(start >= 0 && end > start, '必须能抽取实际 HTTP 路由');
+  const context = {
+    URL, Buffer, Map, Set, console,
+    http: { createServer: callback => callback },
+    https: { request: () => { throw new Error('测试不得访问外网'); } },
+    getSessionFromReq: () => session,
+    jsonResponse: (res, data, status = 200) => { res.writeHead(status); res.end(JSON.stringify(data)); },
+    isSafeCtyunAssetPath: new Function(`${extractFunctionFrom(server, 'isSafeCtyunAssetPath')}\nreturn isSafeCtyunAssetPath;`)(),
+    CTYUN_PROXY_MAX_BODY_BYTES: 10 * 1024 * 1024,
+    fs: { existsSync: file => file.endsWith('app.js') },
+    path, STATIC_DIR: '/static',
+    serveStatic: res => { res.writeHead(200); res.end('local asset'); },
+    proxyStaticAsset: () => { throw new Error('匿名请求不得回源'); },
+    appendLog: () => {}, clientInstances: new Map(), initAllKeepAlive: () => {},
+    setTimeout: () => 0, appConfig: { accounts: [], settings: {} },
+    ...overrides,
+  };
+  const handler = vm.runInNewContext(server.slice(start, end).replace('const server =', 'globalThis.handler ='), context);
+  const request = (url, method = 'GET', headers = {}) => {
+    const req = new EventEmitter();
+    Object.assign(req, { url, method, headers: { host: 'localhost', ...headers }, socket: {},
+      pause() { this.paused = true; }, destroy() { this.destroyed = true; } });
+    const res = new EventEmitter();
+    Object.assign(res, { headersSent: false, writableEnded: false, headers: {},
+      setHeader(name, value) { this.headers[name] = value; },
+      writeHead(status, responseHeaders = {}) { this.statusCode = status; this.headersSent = true; Object.assign(this.headers, responseHeaders); },
+      end(body = '') { this.body = body; this.writableEnded = true; this.emit('finish'); },
+      destroy() { this.destroyed = true; } });
+    return { req, res, run: () => handler(req, res) };
+  };
+  return { request, context };
+}
+
+testAsync('P0-01：匿名控制/回源请求全部拒绝，公开本地登录资源仍可用', async () => {
+  const harness = makePhase1RouteHarness();
+  for (const [url, method] of [
+    ['/api/keeper/restart', 'POST'], ['/api/device/generate', 'POST'],
+    ['/api/ctyun-proxy?target=https%3A%2F%2Fpc.ctyun.cn%2F', 'GET'],
+    ['/workers/bbenc.worker.js', 'GET'], ['/static/bbEncDecoder.wasm', 'GET'],
+    ['/ctyun-static/static/app.js', 'GET'], ['/static/remote.js', 'GET'],
+  ]) {
+    const call = harness.request(url, method);
+    await call.run();
+    assert.strictEqual(call.res.statusCode, 401, `匿名 ${url} 必须拒绝`);
+  }
+  const local = harness.request('/static/app.js');
+  await local.run();
+  assert.strictEqual(local.res.statusCode, 200, '登录页本地 JS 必须公开可用');
+  const ordinary = makePhase1RouteHarness({ role: 'user' }).request('/api/keeper/restart', 'POST');
+  await ordinary.run();
+  assert.strictEqual(ordinary.res.statusCode, 403, '普通用户不得重启全站守护');
+});
+
+testAsync('P0-01：代理拒绝非 HTTPS/夹带用户信息/伪造域名，并限制流式请求体', async () => {
+  const harness = makePhase1RouteHarness({ role: 'user', token: 'test-dashboard-session' });
+  for (const target of ['http://pc.ctyun.cn/', 'https://test-user@pc.ctyun.cn/', 'https://ctyun.cn.evil.example/', 'https://evilctyun.cn/']) {
+    const call = harness.request('/api/ctyun-proxy?target=' + encodeURIComponent(target));
+    await call.run();
+    assert.strictEqual(call.res.statusCode, 403, '非法目标不得发请求');
+  }
+  const call = harness.request('/api/ctyun-proxy?target=https%3A%2F%2Fpc.ctyun.cn%2F', 'POST');
+  await call.run();
+  call.req.emit('data', Buffer.alloc(10 * 1024 * 1024 + 1));
+  call.req.emit('end');
+  assert.strictEqual(call.res.statusCode, 413, '流式请求体超限必须拒绝');
+  assert.ok(call.req.destroyed && call.req.paused, '超限后必须停止读取并关闭请求流');
+  const proxySource = server.slice(server.indexOf("if (pathname === '/api/ctyun-proxy')"), server.indexOf('  // 1. 静态资源'));
+  assert.ok(!/rejectUnauthorized\s*:\s*false/.test(proxySource), '反向代理必须严格校验证书');
+  assert.ok(/'cookie'/.test(proxySource) && /session\.token/.test(proxySource), '仪表盘会话凭据不得转发至上游');
+});
+
+test('P0-01：桌面页 Cookie 可在官方 Authorization 存在时鉴权，非法 Cookie 不致崩溃', () => {
+  const getSession = new Function('authManager', `${extractFunctionFrom(server, 'getSessionFromReq')}\nreturn getSessionFromReq;`)(
+    { verifySession: token => token === 'test-dashboard-session' ? { role: 'user' } : null }
+  );
+  assert.strictEqual(getSession({ headers: { authorization: 'official-token', cookie: 'token=test-dashboard-session' } }).role, 'user');
+  assert.strictEqual(getSession({ headers: { cookie: 'token=%ZZ' } }), null);
+  assert.ok(/Set-Cookie[\s\S]*?HttpOnly; SameSite=Lax/.test(server), '桌面页必须为后续资源请求建立受保护 Cookie');
+});
+
+testAsync('P0-01：静态代理固定主机、路径校验以及 LRU 条目/字节/单文件上限', async () => {
+  const vm = require('vm');
+  const start = server.indexOf('const ctyunStaticCache =');
+  const end = server.indexOf('const server = http.createServer(', start);
+  const source = server.slice(start, end) + '\n({ cacheCtyunStaticAsset, proxyStaticAsset, ctyunStaticCache, get bytes() { return ctyunStaticCacheBytes; } })';
+  const load = () => vm.runInNewContext(source, { Buffer, URL, AbortSignal,
+    fetch: () => { throw new Error('非法目标不得访问网络'); },
+    jsonResponse: (res, data, status) => { res.statusCode = status; },
+  });
+  const api = load();
+  const small = Buffer.alloc(1);
+  for (let i = 0; i < 65; i++) api.cacheCtyunStaticAsset('asset-' + i, small, 'text/plain');
+  assert.strictEqual(api.ctyunStaticCache.size, 64);
+  assert.strictEqual(api.ctyunStaticCache.has('asset-0'), false, '最老条目必须淘汰');
+  const byBytes = load();
+  const chunk = Buffer.alloc(1024 * 1024);
+  for (let i = 0; i < 40; i++) byBytes.cacheCtyunStaticAsset('large-' + i, chunk, 'text/plain');
+  assert.ok(byBytes.bytes <= 32 * 1024 * 1024, '缓存总量不得超过 32 MiB');
+  assert.strictEqual(byBytes.ctyunStaticCache.size, 32);
+  byBytes.cacheCtyunStaticAsset('oversized', Buffer.alloc(8 * 1024 * 1024 + 1), 'text/plain');
+  assert.strictEqual(byBytes.ctyunStaticCache.has('oversized'), false, '超过 8 MiB 不得缓存');
+  for (const target of ['http://pc.ctyun.cn/a.js', 'https://evil.example/a.js', 'https://pc.ctyun.cn/../a.js', 'https://pc.ctyun.cn/a.js?token=x']) {
+    const res = {};
+    await api.proxyStaticAsset(res, target);
+    assert.strictEqual(res.statusCode, 403, '非法静态目标必须在回源前拒绝');
+  }
+});
+
+// ============================================================================
 // 汇总输出（先跑完全部异步断言，再统一出结果）
 // ============================================================================
 (async () => {

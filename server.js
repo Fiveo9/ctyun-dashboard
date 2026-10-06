@@ -3397,25 +3397,58 @@ function parseJsonBody(req) {
 
 function getSessionFromReq(req, parsedUrl = null) {
   const authHeader = req.headers['authorization'] || '';
-  let token = authHeader.replace(/^Bearer\s+/i, '').trim();
-  if (!token && parsedUrl) {
-    token = parsedUrl.searchParams.get('token') || '';
-  }
-  if (!token && req.headers.cookie) {
+  const tokens = [authHeader.replace(/^Bearer\s+/i, '').trim()];
+  if (parsedUrl) tokens.push(parsedUrl.searchParams.get('token') || '');
+  if (req.headers.cookie) {
     const m = req.headers.cookie.match(/(?:^|;\s*)token=([^;]+)/);
-    if (m) token = decodeURIComponent(m[1]);
+    if (m) {
+      try { tokens.push(decodeURIComponent(m[1])); } catch (e) { /* 非法 Cookie 不作为会话 */ }
+    }
   }
-  const session = authManager.verifySession(token);
-  if (session) {
-    session.token = token;
+  // 官方桌面 API 可能携带自己的 Authorization；仍需校验仪表盘 Cookie。
+  for (const token of tokens) {
+    if (!token) continue;
+    const session = authManager.verifySession(token);
+    if (session) {
+      session.token = token;
+      return session;
+    }
   }
-  return session;
+  return null;
 }
 
 // 缓存与代理天翼云电脑官方 Web 资产与模板
 const ctyunStaticCache = new Map();
+const CTYUN_STATIC_MAX_ENTRIES = 64;
+const CTYUN_STATIC_MAX_BYTES = 32 * 1024 * 1024;
+const CTYUN_STATIC_MAX_FILE_BYTES = 8 * 1024 * 1024;
+const CTYUN_STATIC_MAX_RESPONSE_BYTES = 20 * 1024 * 1024;
+const CTYUN_PROXY_MAX_BODY_BYTES = 10 * 1024 * 1024;
+let ctyunStaticCacheBytes = 0;
 let cachedCtyunIndexHtml = '';
 let cachedCtyunIndexTime = 0;
+
+function isSafeCtyunAssetPath(assetPath) {
+  return typeof assetPath === 'string' && /^[A-Za-z0-9_./-]+$/.test(assetPath)
+    && !assetPath.includes('..') && !assetPath.split('/').includes('.');
+}
+
+function cacheCtyunStaticAsset(targetUrl, buffer, contentType) {
+  if (buffer.length > CTYUN_STATIC_MAX_FILE_BYTES) return;
+  const previous = ctyunStaticCache.get(targetUrl);
+  if (previous) {
+    ctyunStaticCacheBytes -= previous.buffer.length;
+    ctyunStaticCache.delete(targetUrl);
+  }
+  while (ctyunStaticCache.size >= CTYUN_STATIC_MAX_ENTRIES
+      || ctyunStaticCacheBytes + buffer.length > CTYUN_STATIC_MAX_BYTES) {
+    const oldestKey = ctyunStaticCache.keys().next().value;
+    ctyunStaticCacheBytes -= ctyunStaticCache.get(oldestKey).buffer.length;
+    ctyunStaticCache.delete(oldestKey);
+  }
+  ctyunStaticCache.set(targetUrl, { buffer, contentType });
+  ctyunStaticCacheBytes += buffer.length;
+}
 
 async function getCtyunIndexHtml() {
   const now = Date.now();
@@ -3440,8 +3473,18 @@ async function getCtyunIndexHtml() {
 }
 
 async function proxyStaticAsset(res, targetUrl) {
+  let target;
+  try { target = new URL(targetUrl); } catch (e) { /* 下方统一拒绝 */ }
+  if (!target || target.protocol !== 'https:' || target.hostname !== 'pc.ctyun.cn'
+      || target.username || target.password || target.port || target.search || target.hash
+      || !isSafeCtyunAssetPath(target.pathname) || targetUrl.includes('..')) {
+    jsonResponse(res, { error: 'Invalid static asset target' }, 403);
+    return;
+  }
   if (ctyunStaticCache.has(targetUrl)) {
     const cached = ctyunStaticCache.get(targetUrl);
+    ctyunStaticCache.delete(targetUrl);
+    ctyunStaticCache.set(targetUrl, cached);
     res.writeHead(200, {
       'Content-Type': cached.contentType,
       'Access-Control-Allow-Origin': '*',
@@ -3453,6 +3496,8 @@ async function proxyStaticAsset(res, targetUrl) {
 
   try {
     const upstreamRes = await fetch(targetUrl, {
+      redirect: 'error',
+      signal: AbortSignal.timeout(15000),
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/137.0.0.0',
         'Referer': 'https://pc.ctyun.cn/'
@@ -3463,8 +3508,24 @@ async function proxyStaticAsset(res, targetUrl) {
       res.end('Upstream error: ' + upstreamRes.status);
       return;
     }
-    const arrayBuf = await upstreamRes.arrayBuffer();
-    const buffer = Buffer.from(arrayBuf);
+    const reader = upstreamRes.body?.getReader();
+    const chunks = [];
+    let totalBytes = 0;
+    if (reader) {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          totalBytes += value.byteLength;
+          if (totalBytes > CTYUN_STATIC_MAX_RESPONSE_BYTES) {
+            await reader.cancel();
+            throw new Error('Static asset exceeds response size limit');
+          }
+          chunks.push(Buffer.from(value));
+        }
+      } finally { reader.releaseLock(); }
+    }
+    const buffer = Buffer.concat(chunks, totalBytes);
     let contentType = upstreamRes.headers.get('content-type') || 'application/octet-stream';
     if (targetUrl.endsWith('.wasm')) contentType = 'application/wasm';
     else if (targetUrl.endsWith('.js')) contentType = 'application/javascript; charset=utf-8';
@@ -3472,9 +3533,7 @@ async function proxyStaticAsset(res, targetUrl) {
     else if (targetUrl.endsWith('.png')) contentType = 'image/png';
     else if (targetUrl.endsWith('.ico')) contentType = 'image/x-icon';
 
-    if (buffer.length < 20 * 1024 * 1024) {
-      ctyunStaticCache.set(targetUrl, { buffer, contentType });
-    }
+    cacheCtyunStaticAsset(targetUrl, buffer, contentType);
 
     res.writeHead(200, {
       'Content-Type': contentType,
@@ -3521,6 +3580,8 @@ function rewardNeedsDesktop(prodId, prodType) {
       res.end('<h3 style="font-family:sans-serif;padding:20px;">未授权：请先在仪表盘登录后再访问云电脑</h3>');
       return;
     }
+    const secureCookie = req.socket?.encrypted ? '; Secure' : '';
+    res.setHeader('Set-Cookie', `token=${encodeURIComponent(session.token)}; Path=/; HttpOnly; SameSite=Lax${secureCookie}`);
 
     const accId = parsedUrl.searchParams.get('accId');
     const acc = appConfig.accounts.find(a => a.id === accId);
@@ -3716,7 +3777,15 @@ function rewardNeedsDesktop(prodId, prodType) {
 
   // 代理天翼云 Web Worker 解码器与组件 (解决“当前浏览器版本过低，无法正常显示画面”问题)
   if (pathname.startsWith('/workers/') || pathname.includes('bbenc.worker.js')) {
+    if (!getSessionFromReq(req, parsedUrl)) {
+      jsonResponse(res, { error: '未授权：请登录后再操作' }, 401);
+      return;
+    }
     const filename = pathname.split('/').pop() || 'bbenc.worker.js';
+    if (!isSafeCtyunAssetPath(filename)) {
+      jsonResponse(res, { error: 'Invalid worker asset path' }, 400);
+      return;
+    }
     const targetUrl = 'https://pc.ctyun.cn/workers/' + filename;
     await proxyStaticAsset(res, targetUrl);
     return;
@@ -3724,7 +3793,15 @@ function rewardNeedsDesktop(prodId, prodType) {
 
   // 代理天翼云 WASM 解码器组件
   if (pathname.includes('bbEncDecoder') || pathname.endsWith('.wasm')) {
+    if (!getSessionFromReq(req, parsedUrl)) {
+      jsonResponse(res, { error: '未授权：请登录后再操作' }, 401);
+      return;
+    }
     const filename = pathname.split('/').pop();
+    if (!isSafeCtyunAssetPath(filename)) {
+      jsonResponse(res, { error: 'Invalid decoder asset path' }, 400);
+      return;
+    }
     const targetUrl = 'https://pc.ctyun.cn/static/common/' + filename;
     await proxyStaticAsset(res, targetUrl);
     return;
@@ -3732,7 +3809,15 @@ function rewardNeedsDesktop(prodId, prodType) {
 
   // 代理天翼云静态资源
   if (pathname.startsWith('/ctyun-static/')) {
-    const relPath = pathname.substring(13).replace(/^\/+/, '');
+    if (!getSessionFromReq(req, parsedUrl)) {
+      jsonResponse(res, { error: '未授权：请登录后再操作' }, 401);
+      return;
+    }
+    const relPath = pathname.slice('/ctyun-static/'.length);
+    if (!isSafeCtyunAssetPath(relPath)) {
+      jsonResponse(res, { error: 'Invalid static asset path' }, 400);
+      return;
+    }
     const targetUrl = 'https://pc.ctyun.cn/' + relPath;
     await proxyStaticAsset(res, targetUrl);
     return;
@@ -3750,6 +3835,15 @@ function rewardNeedsDesktop(prodId, prodType) {
       return;
     }
 
+    const session = getSessionFromReq(req, parsedUrl);
+    if (!session) {
+      jsonResponse(res, { error: '未授权：请登录后再操作' }, 401);
+      return;
+    }
+    if (!['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+      jsonResponse(res, { error: 'Unsupported proxy method' }, 405);
+      return;
+    }
     const targetUrl = parsedUrl.searchParams.get('target');
     if (!targetUrl) {
       jsonResponse(res, { error: 'Missing target' }, 400);
@@ -3758,19 +3852,47 @@ function rewardNeedsDesktop(prodId, prodType) {
 
     try {
       const parsedTarget = new URL(targetUrl);
-      if (!parsedTarget.hostname.endsWith('.ctyun.cn')) {
+      if (parsedTarget.protocol !== 'https:' || parsedTarget.username || parsedTarget.password
+          || !(parsedTarget.hostname === 'ctyun.cn' || parsedTarget.hostname.endsWith('.ctyun.cn'))) {
         jsonResponse(res, { error: 'Invalid proxy target' }, 403);
         return;
       }
 
       const bodyChunks = [];
-      req.on('data', chunk => bodyChunks.push(chunk));
+      let bodyBytes = 0;
+      let bodyRejected = false;
+      const rejectLargeBody = () => {
+        bodyRejected = true;
+        bodyChunks.length = 0;
+        res.once('finish', () => req.destroy());
+        jsonResponse(res, { error: 'Proxy request body too large' }, 413);
+        req.pause();
+      };
+      if (Number(req.headers['content-length']) > CTYUN_PROXY_MAX_BODY_BYTES) {
+        rejectLargeBody();
+        return;
+      }
+      req.on('error', () => {
+        bodyRejected = true;
+        if (!res.headersSent && !res.writableEnded) jsonResponse(res, { error: 'Proxy request stream failed' }, 400);
+      });
+      req.on('aborted', () => { bodyRejected = true; });
+      req.on('data', chunk => {
+        if (bodyRejected) return;
+        bodyBytes += chunk.length;
+        if (bodyBytes > CTYUN_PROXY_MAX_BODY_BYTES) { rejectLargeBody(); return; }
+        bodyChunks.push(chunk);
+      });
       req.on('end', async () => {
+        if (bodyRejected) return;
         const bodyBuffer = Buffer.concat(bodyChunks);
         const outgoingHeaders = {};
         for (const [k, v] of Object.entries(req.headers)) {
           const lk = k.toLowerCase();
-          if (lk === 'host' || lk === 'origin' || lk === 'referer' || lk === 'content-length') continue;
+          if (['host', 'origin', 'referer', 'content-length', 'cookie', 'connection',
+            'transfer-encoding', 'keep-alive', 'te', 'trailer', 'upgrade',
+            'proxy-authorization', 'proxy-authenticate'].includes(lk)) continue;
+          if (lk === 'authorization' && String(v).replace(/^Bearer\s+/i, '').trim() === session.token) continue;
           outgoingHeaders[k] = v;
         }
         outgoingHeaders['host'] = parsedTarget.host;
@@ -3780,11 +3902,10 @@ function rewardNeedsDesktop(prodId, prodType) {
           outgoingHeaders['content-length'] = bodyBuffer.length;
         }
 
-        const clientModule = parsedTarget.protocol === 'http:' ? http : https;
-        const proxyReq = clientModule.request(targetUrl, {
+        const proxyReq = https.request(targetUrl, {
           method: req.method,
           headers: outgoingHeaders,
-          rejectUnauthorized: false
+          timeout: 15000
         }, proxyRes => {
           const respHeaders = {};
           for (const [k, v] of Object.entries(proxyRes.headers)) {
@@ -3800,9 +3921,11 @@ function rewardNeedsDesktop(prodId, prodType) {
         });
 
         proxyReq.on('error', err => {
+          if (res.headersSent || res.writableEnded) { res.destroy(); return; }
           res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ error: 'Proxy request failed: ' + err.message }));
         });
+        proxyReq.on('timeout', () => proxyReq.destroy(new Error('Proxy request timed out')));
 
         if (bodyBuffer.length > 0) {
           proxyReq.write(bodyBuffer);
@@ -3822,6 +3945,10 @@ function rewardNeedsDesktop(prodId, prodType) {
   }
   if (pathname.startsWith('/static/')) {
     const rel = pathname.substring(8);
+    if (!isSafeCtyunAssetPath(rel)) {
+      jsonResponse(res, { error: 'Invalid static asset path' }, 400);
+      return;
+    }
     const file = path.join(STATIC_DIR, rel);
     if (fs.existsSync(file)) {
       let type = 'text/plain';
@@ -3830,6 +3957,10 @@ function rewardNeedsDesktop(prodId, prodType) {
       else if (rel.endsWith('.html')) type = 'text/html; charset=utf-8';
       serveStatic(res, file, type);
     } else {
+      if (!getSessionFromReq(req, parsedUrl)) {
+        jsonResponse(res, { error: '未授权：请登录后再操作' }, 401);
+        return;
+      }
       const targetUrl = 'https://pc.ctyun.cn' + pathname;
       await proxyStaticAsset(res, targetUrl);
     }
@@ -5271,6 +5402,10 @@ function rewardNeedsDesktop(prodId, prodType) {
 
   // 11. 生成设备码
   if (req.method === 'POST' && pathname === '/api/device/generate') {
+    if (!getSessionFromReq(req)) {
+      jsonResponse(res, { error: '未授权：请登录后再操作' }, 401);
+      return;
+    }
     jsonResponse(res, { deviceCode: generateDeviceCode() });
     return;
   }
@@ -6528,6 +6663,15 @@ function rewardNeedsDesktop(prodId, prodType) {
 
   // 21. 重启保活守护
   if (req.method === 'POST' && pathname === '/api/keeper/restart') {
+    const session = getSessionFromReq(req);
+    if (!session) {
+      jsonResponse(res, { error: '未授权：请登录后再操作' }, 401);
+      return;
+    }
+    if (session.role !== 'admin') {
+      jsonResponse(res, { error: '权限不足：仅管理员可重启保活守护' }, 403);
+      return;
+    }
     appendLog('Keeper', '收到重启指令，正在重置所有保活周期...', 'warning');
     for (const [id, client] of clientInstances.entries()) {
       client.stopKeepAliveWorker();

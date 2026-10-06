@@ -1260,6 +1260,20 @@ const MUTATIONS = [
     to: '    ak = None',
     replaceAll: false,
   },
+  {
+    id: 'M122',
+    name: 'P0-01：普通用户重启全站守护的拒绝状态被削弱',
+    file: 'server.js',
+    from: "jsonResponse(res, { error: '权限不足：仅管理员可重启保活守护' }, 403);",
+    to: "jsonResponse(res, { error: '权限不足：仅管理员可重启保活守护' }, 200);",
+  },
+  {
+    id: 'M123',
+    name: 'P0-01：静态缓存总内存上限被放大',
+    file: 'server.js',
+    from: 'const CTYUN_STATIC_MAX_BYTES = 32 * 1024 * 1024;',
+    to: 'const CTYUN_STATIC_MAX_BYTES = 1024 * 1024 * 1024;',
+  },
 ];
 
 // ---------------------------------------------------------------------------

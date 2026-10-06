@@ -48,7 +48,7 @@
 
 | ID | 优先级 | 模块 | 任务简述 | 主要涉及文件 | 状态 |
 | :--- | :--- | :--- | :--- | :--- | :---: |
-| `P0-01` | P0 | `server.js` | 未鉴权接口补齐鉴权与开放代理/缓存限制 | `server.js` | [ ] |
+| `P0-01` | P0 | `server.js` | 未鉴权接口补齐鉴权与开放代理/缓存限制 | `server.js` | [x] |
 | `P0-02` | P0 | `server.js` | 修复 SSRF 过滤绕过（IPv6 方括号/DNS 重绑定/302 跳转） | `server.js` | [ ] |
 | `P0-03` | P0 | `app/static`, `server.js` | 消除存储型 XSS、属性注入与服务端 HTML/Script 注入 | `app/static/app.js`, `server.js` | [ ] |
 | `P0-04` | P0 | `server.js`, `app/static` | API 响应剥离明文密码与会话密钥，编辑弹窗不再回填明文密码 | `server.js`, `app/static/app.js` | [ ] |
@@ -106,6 +106,7 @@
   3. 改造 `ctyunStaticCache` 为带上限的 LRU（如最大条目 `64`、总内存上限 `32 * 1024 * 1024`，单文件上限 `8 * 1024 * 1024`），超限时循环淘汰最早键；在 `proxyStaticAsset` 对 `targetUrl` 校验 `https:` 且主机严格为 `pc.ctyun.cn`，并对 `relPath`/`filename` 禁止 `..` 与非预期字符；在 `/workers/`、`/ctyun-static/`、`/static/` 回源路径核对（若桌面代理页面已登录，可一并校验 `session` 或 Referer/Cookie，注意不得破坏公开登录首页 `/` 所需的 `/static/*` 本地资源）。
   4. 为 `POST /api/device/generate` 补充登录态校验（`if (!session) return 401`），注意确认前端仅在登录后新增/编辑账号弹窗中调用它。
 - **验收**：未登录 `curl -X POST http://127.0.0.1:8571/api/keeper/restart`、`curl "http://127.0.0.1:8571/api/ctyun-proxy?target=https://pc.ctyun.cn/"` 返回 `401`；普通用户调用 `/api/keeper/restart` 返回 `403`。
+- **执行记录（2026-11-24）**：已完成鉴权、桌面页 Cookie 透传、HTTPS/请求体/静态路径限制及有界 LRU；新增 4 项隔离行为回归、2 项变异。Windows + 独立 Python 3.12.10（requests / pycryptodome）回归：208 通过、0 失败；已做只读 review。全阶段变异测试于 P0-07 完成后统一运行。
 
 ---
 

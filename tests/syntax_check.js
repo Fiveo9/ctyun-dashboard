@@ -14,6 +14,8 @@ const ROOT = path.resolve(__dirname, '..');
 
 const FILES = [
   'server.js',
+  'app/auth_manager.js',
+  'app/ydpc/soho_client.js',
   'app/persist_log.js',
   'app/utils/qrcode.js',
   'app/tasks/native_tasks.js',
@@ -37,6 +39,8 @@ let failed = 0;
 // 教训：变异验证曾因清单漂移而退化成假 PASS（见 tests/mutation_check.js 的 2026-09-23 修复）。
 const REQUIRED = [
   'server.js',
+  'app/auth_manager.js',
+  'app/ydpc/soho_client.js',
   'app/utils/qrcode.js',
   'app/ydpc/mqtt_client.js',
   'app/ydpc/product_route.js',

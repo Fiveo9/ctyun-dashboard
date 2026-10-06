@@ -5259,8 +5259,11 @@ async function submitChangePassword() {
     });
     const data = await res.json();
     if (res.ok && data.success) {
-      showToast("密码修改成功，请牢记新密码！", "success");
       closeModal("change-pwd-modal");
+      document.getElementById('new-user-pwd').value = '';
+      document.getElementById('confirm-user-pwd').value = '';
+      logoutUser();
+      showToast('密码修改成功，请使用新密码重新登录！', 'success');
     } else {
       showToast(data.error || "修改失败", "error");
     }
@@ -5296,6 +5299,8 @@ async function submitAdminUserPassword() {
     if (res.ok && data.success) {
       showToast("指定用户密码已成功更新！", "success");
       closeModal("admin-user-pwd-modal");
+      document.getElementById('admin-set-new-pwd').value = '';
+      if (currentUser && currentUser.id === userId) logoutUser();
     } else {
       showToast(data.error || "更新失败", "error");
     }

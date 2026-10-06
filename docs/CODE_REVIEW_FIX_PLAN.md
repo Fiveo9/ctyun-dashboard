@@ -54,7 +54,7 @@
 | `P0-04` | P0 | `server.js`, `app/static` | API 响应剥离明文密码与会话密钥，编辑弹窗不再回填明文密码 | `server.js`, `app/static/app.js` | [x] |
 | `P0-05` | P0 | `app/ydpc` | 关闭 `cag_boot.js` 默认 wireLog 凭据泄露；恢复 `mqtt_client.js` TLS 校验 | `app/ydpc/cag_boot.js`, `app/ydpc/mqtt_client.js` | [x] |
 | `P0-06` | P0 | `app/static` | 移除第三方二维码外链，本地生成扫码登录二维码 | `app/static/app.js`, `server.js` | [x] |
-| `P0-07` | P0 | `auth_manager.js`, `sidecar.py`, 全局 | `scrypt` 密码哈希升级、改密吊销会话、`0600` 落盘与安全随机数 | `app/auth_manager.js`, `app/ecloud_engine/sidecar.py`, `native_tasks.js`, `soho_client.js`, `server.js` | [ ] |
+| `P0-07` | P0 | `auth_manager.js`, `sidecar.py`, 全局 | `scrypt` 密码哈希升级、改密吊销会话、`0600` 落盘与安全随机数 | `app/auth_manager.js`, `app/ecloud_engine/sidecar.py`, `native_tasks.js`, `soho_client.js`, `server.js` | [x] |
 | `P1-01` | P1 | `server.js` | 修复飞书通知未用剥离后 URL 与管理员测推送漏传 `secret` | `server.js` | [ ] |
 | `P1-02` | P1 | `server.js` | 修复 `checkExternalPowerOn` 强行覆写用户手动关闭的保活开关 | `server.js` | [ ] |
 | `P1-03` | P1 | `server.js` | 修复 `refreshOfficialTasks` 40010 未重试及用积分结果掩盖任务读取失败 | `server.js` | [ ] |
@@ -250,6 +250,18 @@
      - `server.js:479-484` 的 `generateDeviceCode()` 使用 `crypto.randomBytes` / `crypto.randomInt`。
   4. **Token 存储与 URL Token 演进说明（需注意回归组 33）**：
      - 当前 `tests/regression.test.js:2046-2057` 强校验前端 `localStorage.setItem("ctyun_auth_token", ...)` 与 `sessionStorage` 逻辑。完成本阶段 XSS 修复（`P0-03`）后窃取风险已大幅降低；如后续决定彻底消除前端 JS 可读 Token，须另立子任务把登录接口改为下发 `HttpOnly; SameSite=Lax` Cookie、为 `/desktop-view` 和 `/api/logs/stream` 改为短时效（如 30s）一次性 ticket，并同步重写回归测试组 33。
+
+- **执行记录（2026-11-24）**：已完成随机盐 scrypt 与常量时间验证、旧 SHA-256 正确登录后平滑迁移、改密吊销目标全部会话及过期惰清。会话吊销无法落盘时不改密并恢复原会话；密码配置保存失败如实返回未完成，不假报成功。本人改密/管理员重置本人后重新登录，重置别人不退出管理员自身会话；保留组 33 的恢复/落盘/销毁和 localStorage/sessionStorage 分流。桌面专用 Cookie 仅用于桌面页及资源，普通 API 保持原有显式凭据优先级。侧车成功登录后清空密码、四个 IPC 返回不再携带未使用的裸 Token，私密文件以 0600 创建并在写入/替换前收紧权限；安全随机串保持原 AES key、Web-Random、UUID、MAC 与设备号协议形状。新增 11 项回归、32 项变异，AuthManager/SOHO 已纳入语法检查；完成本项代码及直接依赖的只读 review。
+- **Phase 1 最终验证**：在 Windows + 隔离 Python 3.12.10（requests / pycryptodome）环境执行，原始 204 项回归保留，侧车行为断言没有跳过。
+
+  | 实际 npm 脚本 / 检查 | 退出码 | 实际结果 | 本机证据 |
+  | :--- | :---: | :--- | :--- |
+  | `npm test` | 0 | 18 个 JS 文件语法通过；234 项回归通过、0 失败、0 跳过 | [最终回归日志](../backups/phase1-20261124.tmp/verification/test-final-2.log) |
+  | `npm run test:mutation` | 0 | 171 项全部捕获，0 漏网、0 BROKEN、0 跳过；末尾原仓库基线 234 通过、0 失败（exit=0） | [完整变异日志](../backups/phase1-20261124.tmp/verification/mutation-final-2.log) |
+  | Python `py_compile`（逐一编译 `app/ecloud_engine/*.py`，pyc 定向到本次临时目录） | 0 | 9 个 Python 文件语法通过 | 本次执行输出：`Python syntax: 9 files passed` |
+
+  为遵守禁止物理删除，上述两个 npm 脚本由本次专用运行器调用（未修改 `package.json`），测试清理转换为可恢复移动。实际入口分别为 `pwsh -NoProfile -File backups/phase1-20261124.tmp/runtime/run-tests.ps1 -Task test -LogName test-final-2.log` 与同一入口的 `-Task mutation -LogName mutation-final-2.log`。初次变异因 M15 的 CRLF 多行匹配失配判为 BROKEN，已中止（退出 -1）；仅将沙箱目标文本统一为 LF 后完整重跑通过，preflight、断言失败判据、真实汇总、最低通过数和超时保护均未削弱。[中止轮诊断日志](../backups/phase1-20261124.tmp/verification/mutation-final.log)保留，不能计作通过。
+- **资格边界与清理**：本阶段为离线结构/行为验证，POSIX 0600 是 Windows 上的契约模拟，不是 Linux/Docker 权限实测；未使用真实云账号、真实 Broker 或手机扫码验证。仅关闭 Phase 1，不推进 P1/P2。源码及计划修改前备份保留在 `backups/phase1-20261124.tmp/`，逐项/最终日志在其 `verification/`；本次 runtime（含临时 Python 工具、pyc、测试副本）及中止轮沙箱已移入项目回收站 `backups/recycle-bin/phase1-20261124-runtime.tmp/`，可恢复，不做物理删除。运行器当前位于回收站，以上入口是实际执行记录，不表示清理后仍可直接运行。
 
 ---
 

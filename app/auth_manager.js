@@ -1,7 +1,26 @@
 const crypto = require('crypto');
 
 function hashPassword(password, salt = 'ctyun_salt_2026') {
-  return crypto.createHash('sha256').update(password + salt).digest('hex');
+  const supplied = salt && salt !== 'ctyun_salt_2026'
+    ? (Buffer.isBuffer(salt) ? salt : Buffer.from(String(salt), 'utf8')) : null;
+  const randomSalt = supplied?.length ? supplied : crypto.randomBytes(16);
+  const hash = crypto.scryptSync(String(password ?? ''), randomSalt, 64);
+  return `scrypt$${randomSalt.toString('hex')}$${hash.toString('hex')}`;
+}
+
+function verifyPassword(password, storedHash) {
+  if (typeof storedHash !== 'string') return false;
+  try {
+    if (storedHash.startsWith('scrypt$')) {
+      const match = /^scrypt\$((?:[0-9a-f]{2})+)\$([0-9a-f]{128})$/i.exec(storedHash);
+      if (!match) return false;
+      const actual = crypto.scryptSync(String(password ?? ''), Buffer.from(match[1], 'hex'), 64);
+      return crypto.timingSafeEqual(actual, Buffer.from(match[2], 'hex'));
+    }
+    if (!/^[0-9a-f]{64}$/i.test(storedHash)) return false;
+    const legacy = crypto.createHash('sha256').update(String(password ?? '') + 'ctyun_salt_2026').digest();
+    return crypto.timingSafeEqual(legacy, Buffer.from(storedHash, 'hex'));
+  } catch (error) { return false; }
 }
 
 class AuthManager {
@@ -44,7 +63,7 @@ class AuthManager {
 
   /** 把 remember=true 的会话写盘（非免登录会话绝不落盘，避免公共电脑被持久化）。 */
   _persistSessions() {
-    if (!this.sessionStore) return;
+    if (!this.sessionStore) return true;
     const out = {};
     for (const [token, s] of this.sessions.entries()) {
       if (!s.remember) continue;
@@ -55,7 +74,8 @@ class AuthManager {
         expiresAt: s.expiresAt,
       };
     }
-    this.sessionStore.save(out);
+    try { return this.sessionStore.save(out) !== false; }
+    catch (error) { return false; }
   }
 
   /** 登出 / 管理员清理：显式销毁会话（含落盘记录）。 */
@@ -64,8 +84,12 @@ class AuthManager {
   }
 
   createSession(user, remember = false) {
-    const token = crypto.randomUUID().replace(/-/g, '');
     const now = Date.now();
+    let expired = false;
+    for (const [oldToken, oldSession] of this.sessions.entries()) {
+      if (now > oldSession.expiresAt) { this.sessions.delete(oldToken); expired = true; }
+    }
+    const token = crypto.randomUUID().replace(/-/g, '');
     const session = {
       userId: user.id,
       username: user.username,
@@ -76,7 +100,7 @@ class AuthManager {
       expiresAt: now + 30 * 24 * 3600 * 1000 // 30天
     };
     this.sessions.set(token, session);
-    if (session.remember) this._persistSessions();
+    if (session.remember || expired) this._persistSessions();
     return token;
   }
 
@@ -109,9 +133,15 @@ class AuthManager {
     const user = (cfg.users || []).find(u => u.username === username);
     if (!user) return { success: false, error: '用户不存在' };
 
-    const hash = hashPassword(password);
-    if (user.passwordHash !== hash) {
+    if (!verifyPassword(password, user.passwordHash)) {
       return { success: false, error: '密码错误' };
+    }
+    if (!user.passwordHash.startsWith('scrypt$')) {
+      const legacyHash = user.passwordHash;
+      try {
+        user.passwordHash = hashPassword(password);
+        if (this.configManager.saveConfig() === false) user.passwordHash = legacyHash;
+      } catch (error) { user.passwordHash = legacyHash; }
     }
 
     const token = this.createSession(user, remember);
@@ -248,11 +278,30 @@ class AuthManager {
   }
 
   updateUserPassword(userId, newPassword) {
+    this.lastPasswordUpdateError = '';
     const cfg = this.configManager.config;
     const user = (cfg.users || []).find(u => u.id === userId);
-    if (!user) return false;
-    user.passwordHash = hashPassword(newPassword);
-    this.configManager.saveConfig();
+    if (!user) { this.lastPasswordUpdateError = '用户不存在'; return false; }
+    let newHash;
+    try { newHash = hashPassword(newPassword); }
+    catch (error) { this.lastPasswordUpdateError = '密码处理失败，请重试'; return false; }
+    const removed = [];
+    for (const [token, session] of this.sessions.entries()) {
+      if (session.userId === userId) { removed.push([token, session]); this.sessions.delete(token); }
+    }
+    // 先确认旧会话吊销可落盘；失败时不得把改密报告为成功。
+    if (!this._persistSessions()) {
+      for (const [token, session] of removed) this.sessions.set(token, session);
+      this.lastPasswordUpdateError = '会话吊销保存失败，密码未修改';
+      return false;
+    }
+    user.passwordHash = newHash;
+    try {
+      if (this.configManager.saveConfig() === false) {
+        this.lastPasswordUpdateError = '密码配置保存未完成，会话已吊销';
+        return false;
+      }
+    } catch (error) { this.lastPasswordUpdateError = '密码配置保存未完成，会话已吊销'; return false; }
     return true;
   }
 
@@ -304,4 +353,4 @@ class AuthManager {
   }
 }
 
-module.exports = { AuthManager, hashPassword };
+module.exports = { AuthManager, hashPassword, verifyPassword };

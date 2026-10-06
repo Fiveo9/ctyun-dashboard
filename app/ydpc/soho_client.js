@@ -51,11 +51,7 @@ const HEADER_ORDER = [
 ];
 
 function genUuid() {
-  const chars = '0123456789ABCDEF';
-  let s = '';
-  for (let i = 0; i < 32; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
-  s = s.substring(0, 12) + '4' + s.substring(13, 16) + (chars.charAt((parseInt(s.charAt(16), 16) & 0x3) | 0x8)) + s.substring(17);
-  return 'uuid_' + s;
+  return 'uuid_' + crypto.randomUUID().replace(/-/g, '').toUpperCase();
 }
 
 function nowMs() {
@@ -64,7 +60,7 @@ function nowMs() {
 
 function genDeviceId() {
   const sn = genUuid().replace('uuid_', '').substring(0, 11).toUpperCase();
-  const mac = Array.from({ length: 6 }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, '0')).join(':');
+  const mac = Array.from(crypto.randomBytes(6), byte => byte.toString(16).padStart(2, '0')).join(':');
   return `${sn}-${mac}`;
 }
 

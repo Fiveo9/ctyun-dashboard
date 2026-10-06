@@ -1,6 +1,17 @@
 const crypto = require('crypto');
 const dns = require('dns');
 
+function secureRandomString(length, chars) {
+  let result = '';
+  const ceiling = 256 - (256 % chars.length);
+  while (result.length < length) {
+    for (const byte of crypto.randomBytes(length - result.length)) {
+      if (byte < ceiling) result += chars[byte % chars.length];
+    }
+  }
+  return result;
+}
+
 const PRESET_MESSAGES = [
   '今天北京天气怎么样？（请用一句话回答）',
   '给我讲一个冷笑话。（简短回答）',
@@ -218,8 +229,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   // 3. 生成 16 字节随机密钥并使用 RSA-PKCS1 加密
   onLog('AIChat', `RSA-PKCS1 加密生成客户端鉴权凭据，换取对话会话密钥 (SessionKey)...`, 'info');
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let clientKey = '';
-  for (let i = 0; i < 16; i++) clientKey += chars[Math.floor(Math.random() * chars.length)];
+  const clientKey = secureRandomString(16, chars);
   const pem = `-----BEGIN PUBLIC KEY-----\n${ssopk}\n-----END PUBLIC KEY-----`;
   const encClientKey = crypto.publicEncrypt({ key: pem, padding: crypto.constants.RSA_PKCS1_PADDING }, Buffer.from(clientKey, 'utf8')).toString('hex');
 
@@ -281,7 +291,7 @@ async function executeNativeAiChat(client, acc, onLog = console.log) {
   const dataMd5 = md5(bodyJsonStr);
   const ts = Date.now().toString();
   let rnd = '';
-  for (let i = 0; i < 8; i++) rnd += chars[Math.floor(Math.random() * chars.length)];
+  for (let i = 0; i < 8; i++) rnd += chars[crypto.randomInt(chars.length)];
   const rawSign = `${dataMd5}&${sk}&${ts}&${rnd}`;
   const webSign = sha256(rawSign);
   const traceId = crypto.randomUUID();

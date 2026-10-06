@@ -5352,7 +5352,7 @@ test('P0-01：桌面页 Cookie 可在官方 Authorization 存在时鉴权，非�
   const getSession = new Function('authManager', `${extractFunctionFrom(server, 'getSessionFromReq')}\nreturn getSessionFromReq;`)(
     { verifySession: token => token === 'test-dashboard-session' ? { role: 'user' } : null }
   );
-  assert.strictEqual(getSession({ headers: { authorization: 'official-token', cookie: 'token=test-dashboard-session' } }).role, 'user');
+  assert.strictEqual(getSession({ url: '/api/ctyun-proxy', headers: { authorization: 'official-token', cookie: 'ctyun_desktop_token=test-dashboard-session' } }).role, 'user');
   assert.strictEqual(getSession({ headers: { cookie: 'token=%ZZ' } }), null);
   assert.ok(/Set-Cookie[\s\S]*?HttpOnly; SameSite=Lax/.test(server), '桌面页必须为后续资源请求建立受保护 Cookie');
 });
@@ -5521,7 +5521,7 @@ function makePhase1FrontendHarness(overrides = {}) {
     'formatYdpcRemainText', 'formatEcloudRemainText', 'htmlToPlainTitle',
     'buildAccountCardElement', 'logLineInnerHtml', 'openAdminUsersModal',
     'editAccount', 'saveAccount', 'saveYdpcAccount', 'saveEcloudAccount',
-    'loadQrCodeForModal', 'showQrLoadFallback'];
+    'loadQrCodeForModal', 'showQrLoadFallback', 'submitChangePassword', 'submitAdminUserPassword'];
   const source = names.map(name => phase1FunctionFrom(phase1AppSource, name)).join('\n') + `\n({ ${names.join(', ')} })`;
   const api = vm.runInNewContext(source, { document: { createElement: element },
     activeEditingAccId: null, _icon: () => '', isDetailsOpen: () => false,
@@ -5967,6 +5967,320 @@ testAsync('P0-06：鉴权路由返回本地图片，前端无需第三方请求�
   await api.loadQrCodeForModal();
   assert.ok(loading.innerText.includes('fixture error'), 'API 失败诊断不得丢失');
   assert.ok(loading.children.some(child => child.innerText === '刷新二维码'));
+});
+
+function makePhase1AuthHarness(failures = {}) {
+  const { AuthManager, hashPassword } = require(path.join(ROOT, 'app/auth_manager.js'));
+  const fixturePassword = 'phase-one-credential';
+  const originalHash = hashPassword(fixturePassword);
+  let disk = {};
+  let configWrites = 0;
+  const manager = {
+    config: { users: [
+      { id: 'u_admin', username: 'fixture-admin', role: 'admin', passwordHash: originalHash, maxQuota: 99 },
+      { id: 'u_user', username: 'fixture-user', role: 'user', passwordHash: originalHash, maxQuota: 2 },
+    ], settings: {}, accounts: [] },
+    saveConfig() {
+      configWrites++;
+      if (failures.configThrow) throw new Error('fixture config failure');
+      return !failures.configFalse;
+    },
+    sessionStore: {
+      load: () => JSON.parse(JSON.stringify(disk)),
+      save(out) {
+        if (failures.sessionThrow) throw new Error('fixture session failure');
+        if (failures.sessionFalse) return false;
+        disk = JSON.parse(JSON.stringify(out));
+        return true;
+      },
+    },
+  };
+  return { auth: new AuthManager(manager), manager, failures, fixturePassword,
+    get disk() { return disk; }, get configWrites() { return configWrites; } };
+}
+
+test('P0-07：scrypt 随机盐、独立摘要与常量时间验证，兼容旧 SHA-256 并拒绝损坏格式', () => {
+  const crypto = require('crypto');
+  const { hashPassword, verifyPassword } = require(path.join(ROOT, 'app/auth_manager.js'));
+  const credential = 'phase-one-hash-probe';
+  const first = hashPassword(credential);
+  const second = hashPassword(credential, 'ctyun_salt_2026');
+  assert.match(first, /^scrypt\$[0-9a-f]{32}\$[0-9a-f]{128}$/);
+  assert.notStrictEqual(first, second, '相同密码不能重复使用固定盐');
+  const [, salt, digest] = first.split('$');
+  assert.strictEqual(digest, crypto.scryptSync(credential, Buffer.from(salt, 'hex'), 64).toString('hex'));
+  assert.strictEqual(verifyPassword(credential, first), true);
+  assert.strictEqual(verifyPassword('wrong-credential', first), false);
+  const legacy = crypto.createHash('sha256').update(credential + 'ctyun_salt_2026').digest('hex');
+  assert.strictEqual(verifyPassword(credential, legacy), true);
+  assert.strictEqual(verifyPassword('wrong-credential', legacy), false);
+  for (const damaged of [null, '', 'not-a-hash', 'scrypt$00$00', 'scrypt$xyz$' + digest, legacy.slice(1)]) {
+    assert.strictEqual(verifyPassword(credential, damaged), false, '损坏格式必须安全拒绝');
+  }
+  const authSource = read('app/auth_manager.js');
+  assert.strictEqual((phase1FunctionFrom(authSource, 'verifyPassword').match(/crypto\.timingSafeEqual\(/g) || []).length, 2);
+});
+
+test('P0-07：旧哈希仅在正确登录后迁移，保存失败继续兼容且不假称已迁移', () => {
+  const crypto = require('crypto');
+  const { verifyPassword } = require(path.join(ROOT, 'app/auth_manager.js'));
+  const h = makePhase1AuthHarness();
+  const user = h.manager.config.users[0];
+  const legacy = crypto.createHash('sha256').update(h.fixturePassword + 'ctyun_salt_2026').digest('hex');
+  user.passwordHash = legacy;
+  assert.strictEqual(h.auth.login(user.username, 'wrong-credential', true).success, false);
+  assert.strictEqual(user.passwordHash, legacy);
+  assert.strictEqual(h.configWrites, 0);
+  assert.strictEqual(h.auth.sessions.size, 0);
+  const login = h.auth.login(user.username, h.fixturePassword, true);
+  assert.strictEqual(login.success, true);
+  assert.ok(user.passwordHash.startsWith('scrypt$'));
+  assert.ok(verifyPassword(h.fixturePassword, user.passwordHash));
+  assert.strictEqual(h.configWrites, 1);
+  assert.ok(h.disk[login.token], 'remember 分流必须保留');
+  for (const failure of ['configFalse', 'configThrow']) {
+    const failedSave = makePhase1AuthHarness({ [failure]: true });
+    const oldUser = failedSave.manager.config.users[0];
+    oldUser.passwordHash = legacy;
+    assert.strictEqual(failedSave.auth.login(oldUser.username, failedSave.fixturePassword).success, true);
+    assert.strictEqual(oldUser.passwordHash, legacy, '未确认保存的升级必须保留旧哈希兼容');
+  }
+});
+
+test('P0-07：改密吊销目标所有会话且重启不复活，其他用户与免登录分流不受影响', () => {
+  const { AuthManager, verifyPassword } = require(path.join(ROOT, 'app/auth_manager.js'));
+  const h = makePhase1AuthHarness();
+  const [admin, user] = h.manager.config.users;
+  const adminHash = admin.passwordHash;
+  const adminToken = h.auth.createSession(admin, true);
+  const oldTokens = [h.auth.createSession(user, true), h.auth.createSession(user, true), h.auth.createSession(user, false)];
+  assert.strictEqual(h.auth.updateUserPassword(user.id, 'phase-one-replacement'), true);
+  for (const token of oldTokens) {
+    assert.strictEqual(h.auth.verifySession(token), null);
+    assert.strictEqual(h.disk[token], undefined);
+  }
+  assert.ok(h.auth.verifySession(adminToken));
+  assert.strictEqual(admin.passwordHash, adminHash);
+  assert.ok(verifyPassword('phase-one-replacement', user.passwordHash));
+  assert.strictEqual(verifyPassword(h.fixturePassword, user.passwordHash), false);
+  const restored = new AuthManager(h.manager);
+  for (const token of oldTokens) assert.strictEqual(restored.verifySession(token), null, '旧 Token 不得在重启后复活');
+  assert.ok(restored.verifySession(adminToken));
+  assert.strictEqual(h.auth.updateUserPassword('absent-user', 'phase-one-replacement'), false);
+});
+
+test('P0-07：吊销保存失败不得改密或丢失旧会话；配置保存失败不得假报成功', () => {
+  for (const failure of ['sessionFalse', 'sessionThrow']) {
+    const h = makePhase1AuthHarness();
+    const user = h.manager.config.users[1];
+    const oldHash = user.passwordHash;
+    const token = h.auth.createSession(user, true);
+    h.failures[failure] = true;
+    assert.strictEqual(h.auth.updateUserPassword(user.id, 'phase-one-replacement'), false);
+    assert.strictEqual(user.passwordHash, oldHash, '吊销未落盘时不得修改密码');
+    assert.ok(h.auth.verifySession(token), '失败时必须恢复内存会话');
+    assert.ok(h.disk[token]);
+    assert.match(h.auth.lastPasswordUpdateError, /会话吊销保存失败/);
+    assert.strictEqual(h.configWrites, 0);
+  }
+  for (const failure of ['configFalse', 'configThrow']) {
+    const h = makePhase1AuthHarness({ [failure]: true });
+    const user = h.manager.config.users[1];
+    const token = h.auth.createSession(user, true);
+    assert.strictEqual(h.auth.updateUserPassword(user.id, 'phase-one-replacement'), false);
+    assert.match(h.auth.lastPasswordUpdateError, /密码配置保存未完成/);
+    assert.strictEqual(h.auth.verifySession(token), null, '已成功吊销的旧会话不得恢复');
+    assert.strictEqual(h.disk[token], undefined);
+  }
+});
+
+test('P0-07：创建会话惰清未被查询的过期条目，并同步磁盘且不持久化临时会话', () => {
+  const h = makePhase1AuthHarness();
+  const user = h.manager.config.users[1];
+  const live = h.auth.createSession(user, true);
+  h.auth.sessions.set('expired-unqueried', { userId: user.id, username: user.username, remember: true, expiresAt: Date.now() - 1000 });
+  h.auth._persistSessions();
+  assert.ok(h.disk['expired-unqueried']);
+  const transient = h.auth.createSession(user, false);
+  assert.strictEqual(h.auth.sessions.has('expired-unqueried'), false, '不经 verifySession 也必须清理过期条目');
+  assert.strictEqual(h.disk['expired-unqueried'], undefined);
+  assert.strictEqual(h.disk[transient], undefined);
+  assert.ok(h.auth.sessions.has(live) && h.disk[live]);
+});
+
+test('P0-07：普通 API 保持显式凭据优先级，桌面专用 Cookie 仅授权桌面页/资源', () => {
+  const getSession = new Function('authManager', `${phase1ServerFunction('getSessionFromReq')}\nreturn getSessionFromReq;`)(
+    { verifySession: token => token === 'dashboard-fixture' ? { role: 'user' } : null }
+  );
+  const legacyCookie = 'token=dashboard-fixture';
+  const desktopCookie = 'ctyun_desktop_token=dashboard-fixture';
+  for (const url of ['/api/auth/me', '/api/admin/users', '/api/accounts', '/api/device/generate', '/api/auth/change-password']) {
+    assert.strictEqual(getSession({ url, headers: { cookie: desktopCookie } }), null, '桌面 Cookie 不得扩散至普通 API');
+    assert.strictEqual(getSession({ url, headers: { authorization: 'Bearer invalid-explicit', cookie: legacyCookie } }), null,
+      '失效显式 Authorization 不得被 Cookie 掩盖');
+    assert.ok(getSession({ url, headers: { authorization: 'Bearer dashboard-fixture' } }));
+  }
+  assert.ok(getSession({ url: '/api/auth/me', headers: { cookie: legacyCookie } }), '原有 Cookie-only 接入保持兼容');
+  assert.strictEqual(getSession({ url: '/api/auth/me', headers: { cookie: legacyCookie } }, new URL('http://fixture/api/auth/me?token=invalid-query')), null);
+  assert.ok(getSession({ url: '/desktop-view', headers: { cookie: desktopCookie } }));
+  for (const url of ['/api/ctyun-proxy', '/workers/bbenc.worker.js', '/ctyun-static/static/a.js', '/static/remote.js', '/static/bbEncDecoder.wasm']) {
+    assert.ok(getSession({ url, headers: { authorization: 'official-desktop-credential', cookie: desktopCookie } }), '官方桌面 Authorization 不得挡住已登录资源回源');
+  }
+});
+
+testAsync('P0-07：改密失败路由如实报错，成功/登出清 Cookie，桌面页不再污染旧 token Cookie', async () => {
+  const session = { userId: 'u_admin', username: 'fixture-admin', role: 'admin', token: 'dashboard-fixture' };
+  let updated = false;
+  let present = true;
+  const revoked = [];
+  const authManager = { updateUserPassword: () => updated, getUserById: () => present ? { id: 'u_user' } : null,
+    updateUserQuota: () => false, lastPasswordUpdateError: 'fixture persistence failed', destroySession: token => revoked.push(token) };
+  const h = makePhase1RouteHarness(session, { authManager, parseJsonBody: async () => ({ newPassword: 'phase-one-replacement', maxQuota: 2 }) });
+  for (const [url, method] of [['/api/auth/change-password', 'POST'], ['/api/admin/users/u_user/password', 'PUT']]) {
+    const call = h.request(url, method);
+    await call.run();
+    assert.strictEqual(call.res.statusCode, 503, '保存失败不得返回成功');
+    assert.strictEqual(JSON.parse(call.res.body).success, undefined);
+    assert.strictEqual(JSON.parse(call.res.body).error, authManager.lastPasswordUpdateError);
+  }
+  present = false;
+  const absent = h.request('/api/admin/users/absent-user/password', 'PUT');
+  await absent.run();
+  assert.strictEqual(absent.res.statusCode, 404);
+  const quota = h.request('/api/admin/users/u_user/quota', 'PUT');
+  await quota.run();
+  assert.strictEqual(quota.res.statusCode, 404, '不改变配额路由原有错误契约');
+  assert.strictEqual(JSON.parse(quota.res.body).error, '用户不存在');
+  updated = true;
+  for (const url of ['/api/auth/change-password', '/api/auth/logout']) {
+    const call = h.request(url, 'POST');
+    await call.run();
+    assert.strictEqual(JSON.parse(call.res.body).success, true);
+    const cookies = call.res.headers['Set-Cookie'];
+    assert.ok(cookies.some(value => value.startsWith('ctyun_desktop_token=;') && value.includes('Max-Age=0')));
+    assert.ok(cookies.some(value => value.startsWith('token=;') && value.includes('Max-Age=0')));
+  }
+  assert.deepStrictEqual(revoked, [session.token]);
+  const desktop = h.request('/desktop-view?accId=absent-account');
+  await desktop.run();
+  assert.ok(desktop.res.headers['Set-Cookie'].startsWith('ctyun_desktop_token='));
+});
+
+testAsync('P0-07：本人改密/管理员重置本人后重新登录，重置别人保留管理员自身会话', async () => {
+  const fields = new Map();
+  const field = id => { if (!fields.has(id)) fields.set(id, { value: '' }); return fields.get(id); };
+  let logoutCalls = 0;
+  let success = true;
+  const { api } = makePhase1FrontendHarness({ document: { getElementById: field }, currentUser: { id: 'u_admin' },
+    showToast() {}, closeModal() {}, logoutUser: () => { logoutCalls++; },
+    authFetch: async () => ({ ok: success, json: async () => ({ success }) }),
+  });
+  field('new-user-pwd').value = field('confirm-user-pwd').value = 'phase-one-replacement';
+  await api.submitChangePassword();
+  assert.strictEqual(logoutCalls, 1);
+  assert.strictEqual(field('new-user-pwd').value, '');
+  assert.strictEqual(field('confirm-user-pwd').value, '');
+  field('admin-edit-user-id').value = 'u_user';
+  field('admin-set-new-pwd').value = 'phase-one-replacement';
+  await api.submitAdminUserPassword();
+  assert.strictEqual(logoutCalls, 1, '重置别人不得登出管理员自己');
+  assert.strictEqual(field('admin-set-new-pwd').value, '');
+  field('admin-edit-user-id').value = 'u_admin';
+  field('admin-set-new-pwd').value = 'phase-one-replacement';
+  await api.submitAdminUserPassword();
+  assert.strictEqual(logoutCalls, 2, '重置本人必须退出旧会话');
+  success = false;
+  field('new-user-pwd').value = field('confirm-user-pwd').value = 'phase-one-replacement';
+  await api.submitChangePassword();
+  assert.strictEqual(logoutCalls, 2, '失败不得假报成功或登出');
+  assert.ok(field('new-user-pwd').value);
+});
+
+test('P0-07：安全随机数保留 AES/Web-Random、UUID、设备号的原协议形状', () => {
+  const vm = require('vm');
+  const crypto = require('crypto');
+  const unsafeMath = { random() { throw new Error('安全随机串不得调用 Math.random'); } };
+  const alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let draws = 0;
+  const rejection = vm.runInNewContext(phase1FunctionFrom(native, 'secureRandomString') + '\nsecureRandomString;', {
+    crypto: { randomBytes: length => { draws++; return draws === 1 ? Buffer.alloc(length, 255) : Buffer.alloc(length, 1); } }, Math: unsafeMath,
+  });
+  assert.strictEqual(rejection(16, alphabet), 'b'.repeat(16));
+  assert.strictEqual(draws, 2, '拒绝采样必须丢弃有模偏差的尾部字节');
+  const aiChat = phase1FunctionFrom(native, 'executeNativeAiChat');
+  const keyStart = aiChat.indexOf('  const chars =');
+  const keyEnd = aiChat.indexOf('  const pem =', keyStart);
+  const key = vm.runInNewContext(phase1FunctionFrom(native, 'secureRandomString') + '\n' + aiChat.slice(keyStart, keyEnd) + '\nclientKey;', { crypto, Math: unsafeMath });
+  assert.match(key, /^[A-Za-z0-9]{16}$/);
+  const randomStart = aiChat.indexOf("  let rnd = '';");
+  const randomEnd = aiChat.indexOf('  const rawSign =', randomStart);
+  const random = vm.runInNewContext(aiChat.slice(randomStart, randomEnd) + '\nrnd;', { crypto, chars: alphabet, Math: unsafeMath });
+  assert.match(random, /^[A-Za-z0-9]{8}$/);
+  const soho = read('app/ydpc/soho_client.js');
+  const sohoSource = ['genUuid', 'genDeviceId'].map(name => phase1FunctionFrom(soho, name)).join('\n') + '\n({ genUuid, genDeviceId })';
+  const ids = vm.runInNewContext(sohoSource, { crypto, Math: unsafeMath });
+  const uuids = Array.from({ length: 16 }, () => ids.genUuid());
+  for (const uuid of uuids) assert.match(uuid, /^uuid_[0-9A-F]{12}4[0-9A-F]{3}[89AB][0-9A-F]{15}$/);
+  assert.strictEqual(new Set(uuids).size, uuids.length);
+  const devices = Array.from({ length: 16 }, () => ids.genDeviceId());
+  for (const device of devices) assert.match(device, /^[0-9A-F]{11}-[0-9a-f]{2}(?::[0-9a-f]{2}){5}$/);
+  assert.strictEqual(new Set(devices.map(device => device.split('-')[1])).size, devices.length);
+  let secureCalls = 0;
+  const deviceCode = vm.runInNewContext(phase1ServerFunction('generateDeviceCode') + '\ngenerateDeviceCode;', {
+    crypto: { randomInt: max => { secureCalls++; assert.strictEqual(max, 62); return 61; } }, Math: unsafeMath,
+  })();
+  assert.strictEqual(deviceCode, 'web_' + '9'.repeat(32));
+  assert.strictEqual(secureCalls, 32);
+});
+
+test('P0-07：原子文件默认 0600/wx，免登录空表仍写私有 JSON 且保存失败可检测', () => {
+  const vm = require('vm');
+  const writes = [];
+  const renames = [];
+  const atomic = vm.runInNewContext(phase1ServerFunction('atomicWriteFileSync') + '\natomicWriteFileSync;', {
+    path, crypto: require('crypto'), fs: { existsSync: () => true,
+      writeFileSync: (...args) => writes.push(args), renameSync: (...args) => renames.push(args),
+      unlinkSync() { throw new Error('测试不得物理删除'); },
+    },
+  });
+  atomic('/fixture/private.json', '{}');
+  assert.strictEqual(writes[0][2].mode, 0o600);
+  assert.strictEqual(writes[0][2].flag, 'wx');
+  assert.strictEqual(renames[0][0], writes[0][0]);
+  assert.strictEqual(renames[0][1], '/fixture/private.json');
+  const start = server.indexOf('const authSessionStore = {');
+  const end = server.indexOf('\n};', start) + 3;
+  assert.ok(start >= 0 && end > start);
+  const storeWrites = [];
+  let failed = false;
+  const store = vm.runInNewContext(server.slice(start, end) + '\nauthSessionStore;', {
+    AUTH_SESSIONS_FILE: '/fixture/auth_sessions.json', fs: {},
+    atomicWriteFileSync: (...args) => { if (failed) throw new Error('fixture disk failure'); storeWrites.push(args); },
+  });
+  assert.strictEqual(store.save({}), true);
+  assert.strictEqual(storeWrites.length, 1, '空表也必须写盘以持久吊销旧会话');
+  assert.strictEqual(storeWrites[0][1], '{}');
+  assert.strictEqual(storeWrites[0][3], 0o600);
+  failed = true;
+  assert.strictEqual(store.save({}), false);
+});
+
+testAsync('P0-07：侧车登录/短信/重登清密码，IPC 无裸 Token，POSIX 0600 写入顺序契约', async () => {
+  const { spawnSync } = require('child_process');
+  let python = process.env.ECLOUD_PYTHON;
+  if (!python) {
+    python = ['python3', 'python'].find(candidate => spawnSync(candidate, ['-c', 'import sys; print(sys.version_info[0])'], { encoding: 'utf8', timeout: 5000 }).status === 0);
+  }
+  if (!python) { lines.push('  SKIP  P0-07 侧车安全行为：未找到 Python（提交前必须在完整依赖环境运行）'); return; }
+  const result = spawnSync(python, [path.join(__dirname, 'ecloud_security_contract.py'), path.join(ROOT, 'app/ecloud_engine')], {
+    encoding: 'utf8', timeout: 15000, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
+  });
+  assert.strictEqual(result.status, 0, String(result.stderr || result.error || '侧车契约未正常退出'));
+  const report = JSON.parse(result.stdout.trim());
+  assert.strictEqual(report.success, true);
+  assert.strictEqual(report.privateMode, '0600');
+  assert.strictEqual(report.loginPaths, 4);
+  assert.strictEqual(report.posixContract, 'simulated', 'Windows 契约模拟不能写成 Linux 实测');
 });
 
 // ============================================================================

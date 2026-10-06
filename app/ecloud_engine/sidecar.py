@@ -139,7 +139,7 @@ def _new_http(device_uid: str) -> "EcloudHttpUtil":
 
 
 # --------------------------------------------------------------------------
-# 会话落盘（免重复登录）—— 只写非敏感字段
+# 会话落盘（免重复登录）—— 密码不写盘，token 文件仅允许所有者访问
 # --------------------------------------------------------------------------
 def _persist_sessions() -> None:
     try:
@@ -156,7 +156,13 @@ def _persist_sessions() -> None:
             }
         _SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _SESSION_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(tmp, flags, 0o600), "w", encoding="utf-8") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), 0o600)
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+        if os.name == "posix":
+            os.chmod(tmp, 0o600)
         os.replace(tmp, _SESSION_FILE)
     except Exception as e:  # 落盘失败不影响本次运行，但必须留证
         _emit_log("warn", f"会话落盘失败（不影响运行）: {type(e).__name__}: {e}")
@@ -231,13 +237,13 @@ def op_login_begin(params: dict) -> dict:
     }
     _SESSIONS[sid] = sess
     if status == login_mod.LoginResult.SUCCESS:
+        sess["password"] = ""
         _persist_sessions()
     _emit_log("info", f"登录分支: {status}")
 
     return {
         "status": status,
         "mobile": r.get("mobile") or "",
-        "accessToken": http.access_token or "",
         "error": r.get("error") or "",
         "errorCode": r.get("error_code") or "",
     }
@@ -285,13 +291,13 @@ def op_login_sms(params: dict) -> dict:
         )
 
     if r.get("status") == login_mod.LoginResult.SUCCESS:
+        s["password"] = ""
         s["accessToken"] = http.access_token
         s["status"] = r.get("status")
         _persist_sessions()
     s["updatedAt"] = time.time()
     return {
         "status": r.get("status"),
-        "accessToken": http.access_token or "",
         "error": r.get("error") or "",
     }
 
@@ -325,7 +331,7 @@ def op_session_restore(params: dict) -> dict:
         "restoredAt": time.time(),
     }
     _emit_log("info", "已从本地保存的 token 恢复会话（免重复登录）")
-    return {"restored": True, "accessToken": saved["accessToken"]}
+    return {"restored": True}
 
 
 def op_session_relogin(params: dict) -> dict:
@@ -356,7 +362,7 @@ def op_session_relogin(params: dict) -> dict:
     status = r.get("status")
     if status == login_mod.LoginResult.SUCCESS:
         s.update({
-            "http": http, "username": username, "password": password,
+            "http": http, "username": username, "password": "",
             "deviceUid": device_uid, "accessToken": http.access_token,
             "status": status, "updatedAt": time.time(),
         })
@@ -364,8 +370,7 @@ def op_session_relogin(params: dict) -> dict:
         # quiet=true：调用方（如周期主动续期）自行落一条更准确的日志，避免"重登成功"误导排查
         if not params.get("quiet"):
             _emit_log("info", "重登成功，token 已刷新")
-        return {"relogged": True, "status": status,
-                "accessToken": http.access_token or ""}
+        return {"relogged": True, "status": status}
 
     _emit_log("error", f"重登未成功: status={status} error={r.get('error') or ''}")
     return {

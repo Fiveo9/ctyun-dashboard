@@ -481,7 +481,7 @@ function sha256(str) {
 function generateDeviceCode() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let s = '';
-  for (let i = 0; i < 32; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
+  for (let i = 0; i < 32; i++) s += chars.charAt(crypto.randomInt(chars.length));
   return 'web_' + s;
 }
 
@@ -919,11 +919,11 @@ async function sendAccountNotification(account, title, content, extraVars = {}) 
 }
 
 // 双平台通用原子文件写入函数 (防断电/防崩溃截断：先写临时文件再原子重命名替换)
-function atomicWriteFileSync(filePath, content, encoding = 'utf8', mode = undefined) {
+function atomicWriteFileSync(filePath, content, encoding = 'utf8', mode = 0o600) {
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const tmpPath = path.join(dir, `.${path.basename(filePath)}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 7)}`);
-  const opts = mode ? { encoding, mode } : { encoding };
+  const tmpPath = path.join(dir, `.${path.basename(filePath)}.tmp.${Date.now()}.${crypto.randomBytes(8).toString('hex')}`);
+  const opts = { encoding, mode, flag: 'wx' };
   fs.writeFileSync(tmpPath, content, opts);
   try {
     try {
@@ -1195,13 +1195,11 @@ const authSessionStore = {
   },
   save: (obj) => {
     try {
-      // 空表直接删除文件，避免残留空壳；写入失败必须静默降级（绝不因会话落盘失败拖垮登录）
-      if (!obj || Object.keys(obj).length === 0) {
-        if (fs.existsSync(AUTH_SESSIONS_FILE)) fs.unlinkSync(AUTH_SESSIONS_FILE);
-        return;
-      }
-      atomicWriteFileSync(AUTH_SESSIONS_FILE, JSON.stringify(obj, null, 2), 'utf8', 0o600);
-    } catch (e) { /* 磁盘不可写时仅内存生效 */ }
+      // 空表也写入私有 JSON，不物理删除文件；登录仍可降级为内存会话。
+      // 改密则必须检查保存结果，防止旧免登录会话在重启后复活。
+      atomicWriteFileSync(AUTH_SESSIONS_FILE, JSON.stringify(obj || {}, null, 2), 'utf8', 0o600);
+      return true;
+    } catch (e) { return false; }
   }
 };
 const authManager = new AuthManager({
@@ -3547,13 +3545,23 @@ function getSessionFromReq(req, parsedUrl = null) {
   const authHeader = req.headers['authorization'] || '';
   const tokens = [authHeader.replace(/^Bearer\s+/i, '').trim()];
   if (parsedUrl) tokens.push(parsedUrl.searchParams.get('token') || '');
+  const pathname = parsedUrl?.pathname || String(req.url || '').split('?')[0];
+  const desktopResource = pathname === '/api/ctyun-proxy' || pathname.startsWith('/workers/')
+    || pathname.startsWith('/ctyun-static/') || pathname.startsWith('/static/')
+    || pathname.includes('bbenc.worker.js') || pathname.includes('bbEncDecoder') || pathname.endsWith('.wasm');
   if (req.headers.cookie) {
+    if (desktopResource || pathname === '/desktop-view') {
+      const desktopCookie = req.headers.cookie.match(/(?:^|;\s*)ctyun_desktop_token=([^;]+)/);
+      if (desktopCookie) {
+        try { tokens.push(decodeURIComponent(desktopCookie[1])); } catch (e) { /* 无效桌面 Cookie 不作为会话 */ }
+      }
+    }
     const m = req.headers.cookie.match(/(?:^|;\s*)token=([^;]+)/);
     if (m) {
       try { tokens.push(decodeURIComponent(m[1])); } catch (e) { /* 非法 Cookie 不作为会话 */ }
     }
   }
-  // 官方桌面 API 可能携带自己的 Authorization；仍需校验仪表盘 Cookie。
+  // 仅桌面资源可能携带官方 Authorization；普通 API 保持原有凭据优先级。
   for (const token of tokens) {
     if (!token) continue;
     const session = authManager.verifySession(token);
@@ -3561,6 +3569,7 @@ function getSessionFromReq(req, parsedUrl = null) {
       session.token = token;
       return session;
     }
+    if (!desktopResource) return null;
   }
   return null;
 }
@@ -3729,7 +3738,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       return;
     }
     const secureCookie = req.socket?.encrypted ? '; Secure' : '';
-    res.setHeader('Set-Cookie', `token=${encodeURIComponent(session.token)}; Path=/; HttpOnly; SameSite=Lax${secureCookie}`);
+    res.setHeader('Set-Cookie', `ctyun_desktop_token=${encodeURIComponent(session.token)}; Path=/; HttpOnly; SameSite=Lax${secureCookie}`);
 
     const accId = parsedUrl.searchParams.get('accId');
     const acc = appConfig.accounts.find(a => a.id === accId);
@@ -4214,6 +4223,10 @@ function rewardNeedsDesktop(prodId, prodType) {
       authManager.destroySession(session.token);
       appendLog('Auth', `用户 [${session.username}] 已退出登录（会话已吊销）`, 'info');
     }
+    res.setHeader('Set-Cookie', [
+      'ctyun_desktop_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0',
+      'token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0',
+    ]);
     jsonResponse(res, { success: true, message: '已退出登录' });
     return;
   }
@@ -4243,7 +4256,14 @@ function rewardNeedsDesktop(prodId, prodType) {
       jsonResponse(res, { error: '新密码长度至少5位' }, 400);
       return;
     }
-    authManager.updateUserPassword(session.userId, newPwd);
+    if (!authManager.updateUserPassword(session.userId, newPwd)) {
+      jsonResponse(res, { error: authManager.lastPasswordUpdateError || '密码修改未完成，请重试' }, 503);
+      return;
+    }
+    res.setHeader('Set-Cookie', [
+      'ctyun_desktop_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0',
+      'token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0',
+    ]);
     appendLog('Auth', `用户 [${session.username}] 修改了自己的登录密码`, 'info');
     jsonResponse(res, { success: true, message: '密码修改成功' });
     return;
@@ -4368,7 +4388,7 @@ function rewardNeedsDesktop(prodId, prodType) {
         appendLog('Admin', `管理员修改了用户 [${userId}] 的登录密码`, 'warning');
         jsonResponse(res, { success: true, message: '用户密码已更新' });
       } else {
-        jsonResponse(res, { error: '用户不存在' }, 404);
+        jsonResponse(res, { error: authManager.lastPasswordUpdateError || '用户不存在' }, authManager.getUserById(userId) ? 503 : 404);
       }
       return;
     }

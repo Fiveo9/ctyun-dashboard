@@ -3485,6 +3485,17 @@ function jsonResponse(res, data, statusCode = 200) {
   res.end(JSON.stringify(data));
 }
 
+function escapeHtmlServer(str) {
+  return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function safeJsonForScript(obj) {
+  const json = JSON.stringify(obj);
+  return typeof json === 'string' ? json.replace(/</g, '\\u003c').replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029') : 'null';
+}
+
 function serveStatic(res, filePath, contentType) {
   fs.readFile(filePath, (err, data) => {
     if (err) {
@@ -3497,9 +3508,9 @@ function serveStatic(res, filePath, contentType) {
         let htmlStr = data.toString('utf8');
         const currentTitle = appConfig.settings?.systemTitle || '天翼云/移动云电脑保活签到中心';
         const currentSubtitle = appConfig.settings?.systemSubtitle || '多账号长连接保活守护 · 多运营商支持 · 每日签到打卡 · 智能挂机';
-        htmlStr = htmlStr.replace(/<h1 id="main-system-title">[^<]*<\/h1>/, `<h1 id="main-system-title">${currentTitle}<\/h1>`);
-        htmlStr = htmlStr.replace(/(<p style="font-size: 13px; color: var\(--text-muted\); margin-top: 2px;">)[^<]*(<\/p>)/, `$1${currentSubtitle}$2`);
-        htmlStr = htmlStr.replace(/<title>[^<]*<\/title>/, `<title>${currentTitle} - 多账号保活控制台<\/title>`);
+        htmlStr = htmlStr.replace(/<h1 id="main-system-title">[^<]*<\/h1>/, () => `<h1 id="main-system-title">${escapeHtmlServer(currentTitle)}</h1>`);
+        htmlStr = htmlStr.replace(/(<p style="font-size: 13px; color: var\(--text-muted\); margin-top: 2px;">)[^<]*(<\/p>)/, (match, prefix, suffix) => `${prefix}${escapeHtmlServer(currentSubtitle)}${suffix}`);
+        htmlStr = htmlStr.replace(/<title>[^<]*<\/title>/, () => `<title>${escapeHtmlServer(currentTitle)} - 多账号保活控制台</title>`);
         content = Buffer.from(htmlStr, 'utf8');
       }
       res.writeHead(200, {
@@ -3773,9 +3784,9 @@ function rewardNeedsDesktop(prodId, prodType) {
 <script>
 (function() {
   // 1. 自动免密注入天翼官方认证凭据至 localStorage
-  const authData = ${JSON.stringify(authDataObj)};
-  const deviceCode = ${JSON.stringify(acc.deviceCode)};
-  const expiredAt = ${JSON.stringify(String(Date.now() + 72 * 3600 * 1000))};
+  const authData = ${safeJsonForScript(authDataObj)};
+  const deviceCode = ${safeJsonForScript(acc.deviceCode)};
+  const expiredAt = ${safeJsonForScript(String(Date.now() + 72 * 3600 * 1000))};
   try {
     localStorage.setItem('web_device_code', deviceCode);
     localStorage.setItem('authExpiredAt', expiredAt);
@@ -3819,7 +3830,7 @@ function rewardNeedsDesktop(prodId, prodType) {
   };
 
   // 4. 路由直接锁定进入云电脑操作界面
-  const targetHash = '#/desktop?id=' + ${JSON.stringify(encodeURIComponent(b64Id))};
+  const targetHash = '#/desktop?id=' + ${safeJsonForScript(encodeURIComponent(b64Id))};
   if (!window.location.hash || window.location.hash.includes('/login') || window.location.hash.includes('/desktop-list')) {
     window.location.hash = targetHash;
   }
@@ -3867,8 +3878,8 @@ function rewardNeedsDesktop(prodId, prodType) {
 
   // 7. 前台网页生命周期与心跳保活双向感知感知探针
   // 打开页面每 5 秒发送心跳证明用户正在操作；页面关闭/离开时立即通知后台恢复保活守护
-  const accId = ${JSON.stringify(acc.id)};
-  const token = ${JSON.stringify(session.token || '')};
+  const accId = ${safeJsonForScript(acc.id)};
+  const token = ${safeJsonForScript(session.token || '')};
   function sendWebHeartbeat() {
     fetch('/api/accounts/' + accId + '/web-active?token=' + encodeURIComponent(token), { method: 'POST' }).catch(() => {});
   }
@@ -3887,7 +3898,7 @@ function rewardNeedsDesktop(prodId, prodType) {
 </script>
 `;
 
-      html = html.replace('<head>', '<head><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"><title>天翼云电脑 - ' + (acc.name || acc.user) + '</title>' + injectScript);
+      html = html.replace('<head>', () => '<head><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"><title>天翼云电脑 - ' + escapeHtmlServer(acc.name || acc.user) + '</title>' + injectScript);
       html = html.replace(/src="static\//g, 'src="/ctyun-static/static/');
       html = html.replace(/src="\.\/static\//g, 'src="/ctyun-static/static/');
       html = html.replace(/href="\.\/static\//g, 'href="/ctyun-static/static/');
@@ -3900,7 +3911,7 @@ function rewardNeedsDesktop(prodId, prodType) {
       res.end(html);
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end('<h3 style="font-family:sans-serif;padding:20px;">连接云电脑服务异常: ' + err.message + '</h3>');
+      res.end('<h3 style="font-family:sans-serif;padding:20px;">连接云电脑服务异常: ' + escapeHtmlServer(err.message) + '</h3>');
     }
     return;
   }

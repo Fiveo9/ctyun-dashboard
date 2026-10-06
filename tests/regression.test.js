@@ -1956,7 +1956,8 @@ test('静态：移动公众开机能力接线（sidecar op → 引擎 → 客户
   // ⑤ UI：名下云主机列表的「🖥️ 开机」按钮必须真实可点并接线；状态徽章必须用合成判定
   assert.ok(/async function bootEcloudDesktop\(/.test(appJs), '前端必须有 bootEcloudDesktop');
   assert.ok(
-    /id="pill-boot-\$\{acc\.id\}-\$\{escapeHtml\(iid\)\}"[\s\S]{0,400}bootEcloudDesktop\('\$\{acc\.id\}'/.test(appJs),
+    /id="pill-boot-\$\{acc\.id\}-\$\{escapeHtml\(iid\)\}"\s+data-action="ecloud-boot"/.test(appJs)
+      && /bootEcloudDesktop\(button\.dataset\.accountId, button\.dataset\.instanceId, button\.dataset\.machineName\)/.test(appJs),
     '「名下云主机」列表必须有真实可点的开机按钮（不再有"开机: 暂不支持"占位）'
   );
   assert.ok(
@@ -5503,6 +5504,133 @@ testAsync('P0-02：全部通知渠道经过 DNS 校验、禁止重定向和 15 �
   }
   assert.strictEqual(calls[3].url, 'https://notify.example/hook', '飞书请求 URL 必须剥离签名后缀');
   assert.ok(!/(?<![\w$])fetch\s*\(/.test(stripLineComments(phase1ServerFunction('sendNotification'))), '通知不得绕过统一安全入口');
+});
+
+const phase1AppSource = read('app/static/app.js');
+
+function makePhase1FrontendHarness(overrides = {}) {
+  const vm = require('vm');
+  const element = () => ({ style: {}, dataset: {}, children: [], listeners: new Map(),
+    innerHTML: '', textContent: '', classList: { add() {}, remove() {}, contains() { return false; } },
+    addEventListener(type, fn) { this.listeners.set(type, fn); },
+    appendChild(child) { this.children.push(child); }, contains() { return true; },
+  });
+  const names = ['escapeHtml', 'isSafeInlineId', 'escapeInlineJsValue', 'handleSafeCardAction',
+    'bindAdminUserActions', 'buildOfficialTasksHtml', 'buildIntervalOverviewText',
+    'buildYdpcVmMonitorHtml', 'buildEcloudDesktopMonitorHtml', 'ecloudViewTone',
+    'formatYdpcRemainText', 'formatEcloudRemainText', 'htmlToPlainTitle',
+    'buildAccountCardElement', 'logLineInnerHtml', 'openAdminUsersModal'];
+  const source = names.map(name => phase1FunctionFrom(phase1AppSource, name)).join('\n') + `\n({ ${names.join(', ')} })`;
+  const api = vm.runInNewContext(source, { document: { createElement: element },
+    activeEditingAccId: null, _icon: () => '', isDetailsOpen: () => false,
+    handleCardDragStart() {}, handleCardDragOver() {}, handleCardDragLeave() {}, handleCardDrop() {}, handleCardDragEnd() {},
+    YDPC_TONE_COLORS: {}, YDPC_TONE_DOTS: {}, ECLOUD_TONE_COLORS: {}, ECLOUD_TONE_DOTS: {},
+    bootEcloudDesktop() {}, openModal() {},
+    ...overrides,
+  });
+  return { api, element };
+}
+
+test('P0-03：HTML 全字符转义、非字符串与 JS 参数保持语义并阻止执行', () => {
+  const { api } = makePhase1FrontendHarness();
+  assert.strictEqual(api.escapeHtml(null), '');
+  assert.strictEqual(api.escapeHtml(0), '0');
+  assert.strictEqual(api.escapeHtml(false), 'false');
+  assert.strictEqual(api.escapeHtml(`&<>"'`), '&amp;&lt;&gt;&quot;&#39;');
+  const payload = `id'); globalThis.compromised = true; //\\\n<>&"`;
+  const encoded = api.htmlToPlainTitle(api.escapeInlineJsValue(payload));
+  const context = { capture: value => { context.captured = value; } };
+  require('vm').runInNewContext(`capture('${encoded}')`, context);
+  assert.strictEqual(context.captured, payload, '回调必须收到原始 ID');
+  assert.strictEqual(context.compromised, undefined, '引号不得逃逸为可执行代码');
+  assert.strictEqual(api.htmlToPlainTitle(api.escapeHtml(`a'b &lt;`)), `a'b &lt;`, 'title 必须还原文本而非显示实体');
+  const log = api.logLineInnerHtml({ timestamp: '<img src=x>', source: '<script>', message: '<svg>', repeatCount: 2 });
+  assert.ok(!/<(?:img|script|svg)/.test(log), '所有日志文本字段必须转义');
+  assert.ok(!/\$\{buildIntervalOverviewText\(acc\)\}/.test(phase1AppSource), '含名称的周期文本不得裸插入 HTML');
+});
+
+test('P0-03：服务端标题/副标题与内联 JSON 不可注入，替换特殊符号原样保留', () => {
+  const vm = require('vm');
+  const title = `Title $& </script><img src=x onerror=1>"'`;
+  const subtitle = 'Subtitle $1 <svg onload=1>';
+  const fixture = '<title>old</title><h1 id="main-system-title">old</h1><p style="font-size: 13px; color: var(--text-muted); margin-top: 2px;">old</p>';
+  const api = vm.runInNewContext(['escapeHtmlServer', 'safeJsonForScript', 'serveStatic'].map(phase1ServerFunction).join('\n')
+    + '\n({ escapeHtmlServer, safeJsonForScript, serveStatic })', { Buffer,
+      appConfig: { settings: { systemTitle: title, systemSubtitle: subtitle } },
+      fs: { readFile: (file, callback) => callback(null, Buffer.from(fixture)) },
+    });
+  const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body.toString(); } };
+  api.serveStatic(res, 'unused', 'text/html');
+  assert.strictEqual(res.status, 200);
+  assert.ok(res.body.includes(api.escapeHtmlServer(title)) && res.body.includes(api.escapeHtmlServer(subtitle)));
+  assert.ok(!/<(?:img|svg|script)/.test(res.body), '标题和副标题不能创建元素');
+  const raw = '</script><script>globalThis.compromised=1</script>&\u2028\u2029';
+  const encoded = api.safeJsonForScript({ value: raw });
+  assert.ok(!/[<>&\u2028\u2029]/.test(encoded), '内联 JSON 不得包含脚本闭合或行分隔字符');
+  assert.strictEqual(JSON.parse(encoded).value, raw);
+  const desktop = server.slice(server.indexOf("if (pathname === '/desktop-view')"), server.indexOf('  // 代理天翼云 Web Worker'));
+  assert.ok(/const authData = \$\{safeJsonForScript\(authDataObj\)\}/.test(desktop));
+  assert.ok(/escapeHtmlServer\(err\.message\)/.test(desktop));
+});
+
+testAsync('P0-03：恶意管理员用户名仅作 data 文本，单一委托保留改密/删除/配额操作', async () => {
+  const username = `"><img src=x onerror=1>'`;
+  const userId = `id'"<svg>`;
+  const calls = [];
+  const tbody = { dataset: {}, listeners: [], rows: [], contains: () => true,
+    addEventListener(type, fn) { this.listeners.push(fn); }, appendChild(row) { this.rows.push(row); }, innerHTML: '',
+  };
+  const { api } = makePhase1FrontendHarness({
+    document: { getElementById: () => tbody, createElement: () => ({ style: {}, innerHTML: '' }) },
+    authFetch: async () => ({ ok: true, json: async () => [{ id: userId, username, role: 'user', accountsCount: 1, maxQuota: 2 }] }),
+    openAdminSetPwdModal: (...args) => calls.push(['password', ...args]),
+    deleteUserAccount: (...args) => calls.push(['delete', ...args]),
+    saveUserQuota: (...args) => calls.push(['quota', ...args]),
+  });
+  await api.openAdminUsersModal();
+  await api.openAdminUsersModal();
+  assert.strictEqual(tbody.listeners.length, 1, '重开弹窗不得重复绑定');
+  for (const row of tbody.rows) {
+    assert.ok(!/onclick=|<img|<svg/.test(row.innerHTML), '用户自由文本不得进入 inline JS 或创建元素');
+    assert.ok(row.innerHTML.includes(api.escapeHtml(username)) && row.innerHTML.includes(api.escapeHtml(userId)));
+  }
+  for (const action of ['js-admin-set-pwd', 'js-admin-del-user', 'js-admin-save-quota']) {
+    const button = { dataset: { userId, username }, classList: { contains: name => name === action } };
+    tbody.listeners[0]({ target: { closest: () => button } });
+  }
+  assert.deepStrictEqual(calls, [['password', userId, username], ['delete', userId, username], ['quota', userId]]);
+});
+
+test('P0-03：三平台卡片与主机字段转义，开机委托保留名称，非法标识只读展示', () => {
+  const payload = `"><img src=x onerror=1>'`;
+  const bootCalls = [];
+  const { api } = makePhase1FrontendHarness({ bootEcloudDesktop: (...args) => bootCalls.push(args) });
+  const metrics = { cycleCountdown: payload, userPoints: payload, successCount: payload, lastHeartbeatResult: payload,
+    officialTasks: [{ name: payload, points: payload, current: payload, total: 1, status: 0 }] };
+  const accounts = [
+    { id: 'safe-account', platform: 'ecloud', user: 'test-user', name: payload, liveMetrics: metrics,
+      desktops: [{ instanceId: 'safe-instance', machineName: payload, originCompanyCode: payload }] },
+    { id: 'safe-account', platform: 'ydpc', user: 'test-user', name: payload, liveMetrics: metrics,
+      vms: [{ userServiceId: '42', vmName: payload, cpu: payload, memory: '4', remainText: payload, vmStatus: '已关机' }] },
+    { id: 'safe-account', platform: 'ctyun', user: 'test-user', name: payload, liveMetrics: metrics,
+      desktops: [{ desktopId: `id'); globalThis.compromised=1; //`, desktopName: payload, cpu: payload, memory: '4', useStatusText: '已关机' }] },
+  ];
+  const cards = accounts.map(account => api.buildAccountCardElement(account, 0));
+  for (const card of cards) {
+    assert.ok(!/<img/.test(card.innerHTML), '卡片字段不得创建元素');
+    assert.ok(card.innerHTML.includes('&lt;img'), '合法字段仍应显示为文本');
+  }
+  assert.ok(/onclick="bootYdpcVm\('safe-account', '42', this\.dataset\.vmName\)"/.test(cards[1].innerHTML), '受保护开机签名保留，名称来自 dataset');
+  const button = { dataset: { accountId: 'safe-account', instanceId: 'safe-instance', machineName: payload } };
+  cards[0].listeners.get('click')({ target: { closest: () => button }, currentTarget: cards[0] });
+  assert.deepStrictEqual(bootCalls, [['safe-account', 'safe-instance', payload]]);
+  const invalid = { id: payload, name: payload, platform: 'ecloud' };
+  const card = api.buildAccountCardElement(invalid, 0);
+  assert.strictEqual(card.innerHTML, '', '非法账号标识不得进入模板');
+  assert.ok(card.textContent.includes('操作已禁用'));
+  assert.strictEqual(invalid.id, payload, '安全校验不得重写配置标识');
+  const invalidVm = api.buildAccountCardElement({ id: 'safe-account', platform: 'ydpc', user: 'test-user', vms: [{ userServiceId: payload, vmName: payload }] }, 0);
+  assert.ok(!/<img/.test(invalidVm.innerHTML));
 });
 
 // ============================================================================

@@ -1295,6 +1295,34 @@ const MUTATIONS = [
     from: 'const candidates = publicTarget.addresses.filter(addr => !lookupOptions.family || addr.family === lookupOptions.family);',
     to: "const candidates = [{ address: '127.0.0.1', family: 4 }];",
   },
+  {
+    id: 'M127',
+    name: 'P0-03：HTML 单引号转义被撤销',
+    file: 'app/static/app.js',
+    from: ".replace(/'/g, '&#39;');",
+    to: '.replace(/\'/g, String.fromCharCode(39));',
+  },
+  {
+    id: 'M128',
+    name: 'P0-03：内联 JSON 不再转义脚本闭合字符',
+    file: 'server.js',
+    from: 'function safeJsonForScript(obj) {',
+    to: 'function safeJsonForScript(obj) { return JSON.stringify(obj);',
+  },
+  {
+    id: 'M129',
+    name: 'P0-03：移动公众开机委托失去真实调用',
+    file: 'app/static/app.js',
+    from: 'bootEcloudDesktop(button.dataset.accountId, button.dataset.instanceId, button.dataset.machineName);',
+    to: 'void button.dataset.machineName;',
+  },
+  {
+    id: 'M130',
+    name: 'P0-03：管理员用户名 data 属性不再转义',
+    file: 'app/static/app.js',
+    from: 'data-username="${escapeHtml(u.username)}"',
+    to: 'data-username="${u.username}"',
+  },
 ];
 
 // ---------------------------------------------------------------------------

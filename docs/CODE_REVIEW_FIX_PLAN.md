@@ -50,7 +50,7 @@
 | :--- | :--- | :--- | :--- | :--- | :---: |
 | `P0-01` | P0 | `server.js` | 未鉴权接口补齐鉴权与开放代理/缓存限制 | `server.js` | [x] |
 | `P0-02` | P0 | `server.js` | 修复 SSRF 过滤绕过（IPv6 方括号/DNS 重绑定/302 跳转） | `server.js` | [x] |
-| `P0-03` | P0 | `app/static`, `server.js` | 消除存储型 XSS、属性注入与服务端 HTML/Script 注入 | `app/static/app.js`, `server.js` | [ ] |
+| `P0-03` | P0 | `app/static`, `server.js` | 消除存储型 XSS、属性注入与服务端 HTML/Script 注入 | `app/static/app.js`, `server.js` | [x] |
 | `P0-04` | P0 | `server.js`, `app/static` | API 响应剥离明文密码与会话密钥，编辑弹窗不再回填明文密码 | `server.js`, `app/static/app.js` | [ ] |
 | `P0-05` | P0 | `app/ydpc` | 关闭 `cag_boot.js` 默认 wireLog 凭据泄露；恢复 `mqtt_client.js` TLS 校验 | `app/ydpc/cag_boot.js`, `app/ydpc/mqtt_client.js` | [ ] |
 | `P0-06` | P0 | `app/static` | 移除第三方二维码外链，本地生成扫码登录二维码 | `app/static/app.js`, `server.js` | [ ] |
@@ -163,6 +163,7 @@
      - `server.js:3370-3372` 使用 `() => ...` 回调函数替换，并对 `currentTitle`/`currentSubtitle` 调用 `escapeHtmlServer()`。
      - `server.js:3585-3587` 改为 `safeJsonForScript(...)`，`3699` 和 `3712` 对 `acc.name || acc.user`、`err.message` 调用 `escapeHtmlServer()`。
 - **验收**：注册用户名 `"><img src=x onerror=alert(1)>'` 后在管理员视图打开用户管理弹窗，不弹窗、DOM 正常文本展示且修改密码/删除按钮功能正常。
+- **执行记录（2026-11-24）**：完成 HTML/属性/内联 JS/Script JSON 分上下文转义，管理按钮和移动公众开机改为 data 属性委托；移动公众原 inline 接线断言同步为委托接线并新增行为验证，移动爱家受保护调用格式保留、名称由 dataset 传入。非法账号/受保护回调主机标识只读展示，配置标识不改写。新增 4 项攻击载荷回归、4 项变异；完整回归 215 通过、0 失败，已做只读 review。浏览器真机验收不计作已执行。
 
 ---
 
